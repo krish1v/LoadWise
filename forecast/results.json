@@ -1,0 +1,24 @@
+{
+  "regression": {
+    "mae": 24.26,
+    "rmse": 37.4,
+    "bias": -10.08
+  },
+  "athlete_history": {
+    "mae": 25.14,
+    "rmse": 38.82,
+    "bias": -15.21
+  },
+  "pooled_history": {
+    "mae": 26.62,
+    "rmse": 40.42,
+    "bias": -9.34
+  },
+  "train_n": 914,
+  "test_n": 50,
+  "cutoff_day": 116,
+  "unseen_test_athletes": [
+    "Player 15"
+  ],
+  "missing_test_gd": 50
+}
