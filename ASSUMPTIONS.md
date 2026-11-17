@@ -32,7 +32,13 @@ These need agreement with the coach or the teammates. Each item says what LoadWi
   - how to treat partial days (e.g. game days without Movement Load)
 - The squad view's 7/28-day sums are display only. They sum the known values over observed days and are not ACWR.
 
-## Forecast layer
-- The Forecast view consumes the modelling team's trained artifact (`forecast/loadwise_model.joblib`) as-is. It predicts **training** TRIMP from planned minutes only, not games, injury or readiness.
-- Forecast days start the day after the athlete's last recorded session. Athletes missing from the model's training data (e.g. Player 15) fall back to the squad rate.
-- Its accuracy figures come from a 50-session holdout and should be treated as exploratory.
+## Training planner (modelling team's models)
+- `planner/` runs the modelling team's fitted models and optimizer unchanged (SamuelO12/createx-loadwise, `prototype/`, commit `e5ec641`). Only the data source changed: the models' inputs are built from LoadWise daily records instead of the team's own workbook reader. On the supplied workbook both produce the same 1,049 training days and 158 game days, and the team's reference plan is reproduced exactly.
+- **Rules carried over from the team** (they differ from LoadWise's own daily totals):
+  - only training sessions feed the models; game sessions only count towards "games in the last 7 days"
+  - a day's Movement Load, TRIMP, duration or high-intensity minutes is treated as unknown unless **every** training session that day recorded it (LoadWise itself reports a partial sum with coverage)
+  - MIP 1min is the day's highest training-session value
+- **Fitted period.** The models were fitted on 11 Sep to 14 Dec 2025 (study days 1–95) and tested on the following weeks. A plan starting on or before 14 Dec 2025 replays data the models have seen; the UI says so.
+- **Athletes the models have not seen** (or with fewer than three measured MIP days, or none in the last 28 days) can only use the squad-level duration-only models, after the coach confirms it. Athletes are matched to the models by exact label (`Player 01`); there is no fuzzy matching.
+- **Version.** The model files were saved with scikit-learn 1.8.0. With 1.9.1 the reference result still matches to 1e-6, which the tests check.
+- **Scope.** The planner predicts next-day training outcomes and picks training minutes within coach-set limits. Games and rest are not modelled, history is held fixed through the week, and suggested limits come from percentiles of the training data. It is not an injury, readiness or safety prediction. The earlier Option B TRIMP forecast was replaced by these models.

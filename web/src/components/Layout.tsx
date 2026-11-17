@@ -12,7 +12,7 @@ const NAV = [
   { to: "/calendar", label: "Calendar", icon: CalendarDays },
   { to: "/daily", label: "Daily data", icon: Table2 },
   { to: "/quality", label: "Data quality", icon: ShieldCheck },
-  { to: "/forecast", label: "Forecast", icon: LineChart },
+  { to: "/plan", label: "Training plan", icon: LineChart },
 ];
 
 export function Layout({ children }: { children: ReactNode }) {

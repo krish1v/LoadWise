@@ -378,70 +378,99 @@ def create_app(db_path: Optional[str] = None, autoload_demo: Optional[bool] = No
         return Response(need().to_daily_csv(), media_type="text/csv",
                         headers={"Content-Disposition": "attachment; filename=loadwise_daily.csv"})
 
-    # -- forecast (teammate's Option B model) ------------------------------
-    def forecaster():
-        from loadwise.forecast import ForecastUnavailable, Forecaster
-        try:
-            return Forecaster()
-        except ForecastUnavailable as e:
-            raise HTTPException(503, str(e))
+    # -- training planner (modelling team's models, see planner/) ---------
+    plan_lock = threading.Lock()
 
-    @app.get("/api/forecast/meta")
-    def forecast_meta():
-        fc = forecaster()
-        return {"known_athletes": fc.known_athletes(), "global_rate": fc.global_rate,
-                "validation": fc.results,
-                "scope": "Predicts upcoming TRAINING session TRIMP only (planned minutes × learned "
-                         "TRIMP/min). Not games, injury, readiness or recommendations."}
+    def planning():
+        from planner import PlanningContext
+        res = need()
+        cached = getattr(state, "planning", None)
+        if cached is None or cached[0] is not res:
+            state.planning = (res, PlanningContext(res.daily_records))
+        return res, state.planning[1]
 
-    def _label(res, athlete_id):
+    def plan_label(res, athlete_id: str) -> str:
         a = next((a for a in res.output["athletes"] if a["athlete_id"] == athlete_id), None)
         if a is None:
             raise HTTPException(404, "Unknown athlete")
-        return a
+        return a["label"]
 
-    def _minutes(minutes: str) -> List[float]:
+    @app.get("/api/plan/meta")
+    def plan_meta():
+        from planner import FITTING_PERIOD, REFERENCE_DEMO, SCHEDULE
+        from planner.features import day_date, day_number
+        res, ctx = planning()
+        counts = ctx.daily.groupby("athlete_id").agg(training_days=("day", "size"),
+                                                      measured_mip_days=("mip1", "count"))
+        roster = []
+        for a in res.output["athletes"]:
+            if a["label"] in counts.index:
+                c = counts.loc[a["label"]]
+                roster.append({"athlete_id": a["athlete_id"], "label": a["label"],
+                               "training_days": int(c.training_days),
+                               "measured_mip_days": int(c.measured_mip_days),
+                               "last_date": a["history"]["last_date"]})
+        demo = None
+        demo_id = next((r["athlete_id"] for r in roster if r["label"] == REFERENCE_DEMO["athlete"]), None)
+        if demo_id and ctx.first_day <= day_number(REFERENCE_DEMO["start"]) <= ctx.last_day:
+            demo = {**REFERENCE_DEMO, "athlete": demo_id}
+        return {
+            "roster": roster,
+            "first_start": day_date(ctx.first_day) if ctx.first_day else None,
+            "last_start": day_date(ctx.last_day) if ctx.last_day else None,
+            "schedule": SCHEDULE,
+            "fitting_period": FITTING_PERIOD,
+            "demo": demo,
+            "scope": "Predicts next-day training outcomes (MIP 1min, Movement Load, TRIMP) from the "
+                     "athlete's history and planned recording duration, then picks training minutes "
+                     "within coach-set workload limits. Training days only: games and rest are not "
+                     "modelled. Not an injury, readiness or safety prediction.",
+        }
+
+    @app.get("/api/plan/history")
+    def plan_history(athlete: str, start: str):
+        from planner import jsonable
+        from planner.features import day_date
+        from planner.scenarios import in_fitting_period, week_dates
+        res, ctx = planning()
+        label = plan_label(res, athlete)
         try:
-            vals = [max(0.0, float(x)) for x in minutes.split(",") if x.strip() != ""]
-        except ValueError:
-            raise HTTPException(400, "minutes must be a comma-separated list of numbers")
-        if not vals or len(vals) > 28:
-            raise HTTPException(400, "Provide between 1 and 28 planned durations")
-        return vals
+            day = ctx.start_day(start)
+            planning_inputs, reason, past, history = ctx.defaults(label, day)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        cols = ["date", "mip1", "movement_load", "training_trimp", "recorded_duration_min"]
+        return jsonable({
+            "athlete_id": athlete, "label": label, "start": day_date(day),
+            "week_dates": week_dates(day),
+            "planning": planning_inputs, "reason": reason, "personalized": reason is None,
+            "in_fitting_period": in_fitting_period(day),
+            "features": history,
+            "history": past[cols].astype(object).where(past[cols].notna(), None).to_dict("records"),
+        })
 
-    @app.get("/api/forecast/{athlete_id}")
-    def forecast(athlete_id: str, minutes: str = "90,90,75,0,90,60,0"):
-        res = need()
-        a = _label(res, athlete_id)
-        fc = forecaster()
-        out = fc.forecast(a["label"], _minutes(minutes))
-        last = a["history"]["last_date"]
-        start = (dt.date.fromisoformat(last) + dt.timedelta(days=1)) if last else None
-        for d in out["days"]:
-            d["date"] = (start + dt.timedelta(days=d["day_index"] - 1)).isoformat() if start else None
-        hist = []
-        for d in res.daily_records:
-            if d["athlete_id"] != athlete_id:
-                continue
-            t, m = d["breakdown"]["training"]["trimp"], d["breakdown"]["training"]["duration_min"]
-            if t["completeness"] == "complete" and m["completeness"] == "complete" and m["value"]:
-                hist.append({"date": d["date"], "training_trimp": t["value"], "training_minutes": m["value"],
-                             "trimp_per_min": t["value"] / m["value"]})
-        rates = sorted(h["trimp_per_min"] for h in hist)
-        out["observed_history"] = hist[-28:]
-        out["observed_median_trimp_per_min"] = rates[len(rates) // 2] if rates else None
-        return out
+    @app.post("/api/plan/optimize")
+    def plan_optimize(config: dict):
+        from planner import jsonable, recommend
+        res, ctx = planning()
+        if not isinstance(config.get("athlete"), str):
+            raise HTTPException(400, "Select an athlete.")
+        config = {**config, "athlete": plan_label(res, config["athlete"])}
+        if not plan_lock.acquire(blocking=False):
+            raise HTTPException(409, "An optimization is already running. Try again when it finishes.")
+        try:
+            result = recommend(ctx, config)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        finally:
+            plan_lock.release()
+        result.pop("csv", None)
+        return jsonable(result)
 
-    @app.get("/api/forecast/{athlete_id}/baseline.json")
-    def forecast_baseline(athlete_id: str, minutes: str = "90,90,75,0,90,60,0"):
-        res = need()
-        a = _label(res, athlete_id)
-        last = a["history"]["last_date"]
-        start = (dt.date.fromisoformat(last) + dt.timedelta(days=1)).isoformat() if last else None
-        body = forecaster().baseline_export(a["label"], _minutes(minutes), start_date=start)
-        body["athlete_id"] = athlete_id
-        return JSONResponse(body, headers={"Content-Disposition":
-                                           f"attachment; filename=baseline_{athlete_id}.json"})
+    @app.get("/api/plan/models")
+    def plan_models():
+        from planner import model_evidence
+        return model_evidence()
 
     # -- static frontend -------------------------------------------------
     if os.path.isdir(DIST):

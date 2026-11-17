@@ -178,8 +178,14 @@ def validate_sessions(records: List[dict], config: Config, fc: FlagCollector) ->
                    f"Expected minimum ≤ average ≤ peak heart rate, got {lo} / {avg} / {pk}.",
                    "Heart rate is not aggregated; workload metrics unaffected.", rec, "heart_rate",
                    {"min": lo, "avg": avg, "peak": pk})
+        for k, v in rec["peak_intensity"].items():
+            if v is not None and v < 0:
+                fc.add("NEGATIVE_METRIC", "error", f"{k} is negative ({v:.2f}), which is impossible.",
+                       f"Treated as missing (null) for {k} only; other metrics still count.",
+                       rec, k, src.get(k))
+                rec["peak_intensity"][k] = None
         for k in ("hr_avg", "hr_min", "hr_peak", "trimp_per_min", "avg_movement_intensity",
-                  "source_acwr", "source_acute_load", "source_chronic_load"):
+                  "mip1", "mip3", "source_acwr", "source_acute_load", "source_chronic_load"):
             prob = rec["parse_problems"].get(k)
             if prob:
                 fc.add("NON_NUMERIC_VALUE", "info", f"{k} value {src.get(k)!r} is not a usable number.",

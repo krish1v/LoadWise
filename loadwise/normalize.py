@@ -186,6 +186,8 @@ def rollover_preview(raw_dates: List[object], config: Config) -> List[dict]:
 # -------------------------------------------------------- normalized records --
 
 PRIMARY_METRICS = ("duration_min", "trimp", "movement_load", "hit_min")
+# Per-session peak values: they are combined per day with max(), never summed.
+PEAK_METRICS = ("mip1", "mip3")
 
 
 def _bucket(mtype: Optional[str], config: Config) -> str:
@@ -283,6 +285,7 @@ def normalize_session(rec: RawRecord, mapping: dict, config: Config, epoch) -> d
             "trimp_per_min": num("trimp_per_min"),
             "avg_movement_intensity": num("avg_movement_intensity"),
         },
+        "peak_intensity": {k: num(k) for k in PEAK_METRICS},
         "measurement_error_pct": err_pct,
         "measurement_error_interpretation": err_interp,
         "heart_rate": {"avg_bpm": num("hr_avg"), "min_bpm": num("hr_min"), "peak_bpm": num("hr_peak")},

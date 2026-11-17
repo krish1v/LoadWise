@@ -37,6 +37,8 @@ FULL_DAY_COLUMNS = {
     "trimp_per_min": "TRIMP/min (Index)",
     "movement_load": "Movement load",
     "avg_movement_intensity": "Average movement intensity",
+    "mip1": "Maximal Intensity Period MI 1min",
+    "mip3": "Maximal Intensity Period MI 3min",
     "hr_avg": "Average HR (bpm)",
     "hr_min": "Minimum HR (bpm)",
     "hr_peak": "Peak HR (bpm)",

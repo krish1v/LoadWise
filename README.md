@@ -6,7 +6,8 @@ This repository holds the **data layer** and the **web UI** built around it:
 
 - `loadwise/`: a pure-Python library. It reads the per-session Excel export, standardizes and validates it, and produces **one record per athlete per day**, with explicit completeness and full provenance. It is model-independent: no optimization, injury prediction, readiness or recommendations.
 - `api/`: a small FastAPI service. It stores uploads in SQLite so athlete histories build up over time.
-- `web/`: a React app with squad overview, athlete timelines, a season calendar heatmap, daily data, data quality review and the training-load forecast.
+- `planner/`: the modelling team's prediction models and weekly optimizer ([SamuelO12/createx-loadwise](https://github.com/SamuelO12/createx-loadwise), `prototype/`, commit `e5ec641`), fed by LoadWise's validated daily records. It is kept separate from `loadwise/`, which stays model-independent.
+- `web/`: a React app with squad overview, athlete timelines, a season calendar heatmap, daily data, data quality review and the training planner.
 
 > **ACWR scope.** Source-reported ACWR, Acute Training Load and Chronic Training Load are preserved **as source-reported fields only**. They are never recalculated or treated as validated. LoadWise provides clean daily histories (observed dates plus explicit gaps) for a **future, separate ACWR module**. Its window definitions and missing-day policy still need agreement (see `ASSUMPTIONS.md`).
 
@@ -39,7 +40,7 @@ uvicorn api.main:app            # http://localhost:8000  (API + built UI)
 | **Calendar** | Squad × date heatmap for one metric, with game days marked. |
 | **Daily data** | Filter by athlete, date range, partial days, multi-session days or days with issues. Download the daily CSV or the full JSON. |
 | **Data quality** | Counts (records, athletes, resolved dates, errors, warnings, excluded duplicates), the duplicate review queue (count it / leave it out, with a required reason; totals recalculate), the filterable issue table, a side-by-side original-vs-normalized record inspector, and the imported files with *Clear history*. |
-| **Forecast** | The teammate's Option B model: planned training minutes in, predicted training TRIMP out, drawn on top of recorded history. Shows its validation figures and exports the `expected_baseline_workload` JSON for the optimizer. |
+| **Training plan** | The modelling team's models and optimizer. Pick an athlete and the first day of the week, set training / game / rest per day, minutes and workload limits, and create the plan. It shows the predicted MIP 1min, Movement Load and TRIMP per training day against the original plan, the history the models read from LoadWise, and the models' validation and test accuracy. **Run the reference example** (or open `/plan?demo=1`) reproduces the team's reference week for Player 01 from 16 Dec 2025. |
 
 The **drill-down drawer** (from any chart, table row or calendar cell) shows one athlete-day:
 - totals and training/game/other splits, each with coverage
@@ -85,30 +86,33 @@ process_workbook([("a.xlsx", bytes_a), ("b.xlsx", bytes_b)], Config(season_start
 | GET | `/api/flags`, `/api/records/{record_id}`, `/api/review` | issues, record inspector, duplicate queue |
 | POST/DELETE | `/api/overrides` | include/exclude with reason; clear |
 | GET | `/api/export.json?include_raw=`, `/api/export.csv` | downloads |
-| GET | `/api/forecast/meta`, `/api/forecast/{athlete_id}?minutes=90,60,…`, `…/baseline.json` | prediction layer |
+| GET | `/api/plan/meta`, `/api/plan/history?athlete=&start=` | planner roster, date range, suggested inputs and the athlete's model inputs |
+| POST | `/api/plan/optimize` | create a seven-day plan (JSON config, as in `planner.REFERENCE_DEMO`) |
+| GET | `/api/plan/models` | model comparison and feature importance |
 
 Interactive docs: http://localhost:8000/docs
 
 ## Tests
 
 ```bash
-pytest -q                  # 72 tests, ~45 s
+pytest -q                  # 77 tests
 cd web && npm run build    # includes the TypeScript type-check
 ```
 
 - **Synthetic fixtures** (built in `tests/conftest.py`) cover every acceptance criterion: same-day sessions, splits that reconcile, `0.0625` → 90 min, the Dec→Jan rollover, the missing-year request, the Wellness header below blank rows, exact and possible duplicates, idempotency, missing vs zero, partial coverage, isolation of invalid fields, ratio rules, graceful failures, and JSON traceability.
 - **Real-workbook test:** `tests/test_integration_real.py` smoke-tests the supplied workbook.
-- **API test:** `tests/test_api.py` drives the API and store, including the re-upload no-op, overrides, exports and the forecast.
+- **API test:** `tests/test_api.py` drives the API and store, including the re-upload no-op, overrides, exports and the planner. The planner test checks that LoadWise data reproduces the modelling team's reference result (Day 7 MIP 8.036, Movement Load 1,696.33, TRIMP 728.47).
+- **Planner test:** `tests/test_planner.py` checks how daily records become model inputs (MIP is the training-day max, sums need every training session, game days, calendar-day windows) and the squad-model fallback.
 
 ## Layout
 
 ```
-loadwise/   config · ingest · normalize · validate · aggregate · export · pipeline · store · forecast
+loadwise/   config · ingest · normalize · validate · aggregate · export · pipeline · store
+planner/    features (LoadWise → model inputs) · predict · scenarios · optimize · recommend · artifacts/
 api/        main.py (FastAPI)
 web/        Vite + React + TypeScript (Tailwind, TanStack Query/Table, ECharts)
 scripts/    generate_sample_output.py
 sample_output/   JSON + daily CSV from the real workbook (season year 2025, set explicitly)
-forecast/   the teammate's trained model, validation results and brief
 ```
 
 The pipeline is a pure function of (file bytes, config, overrides). The SQLite store keeps only those inputs and recomputes from them, so every number in the UI can be reproduced from the files.

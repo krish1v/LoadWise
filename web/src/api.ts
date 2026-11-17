@@ -207,27 +207,70 @@ export interface Preview {
   rollover: { month: number; month_name: string; records: number; example: string; resolved_year: number | null }[];
 }
 
-export interface ForecastResponse {
-  athlete_label: string;
-  known_athlete: boolean;
-  historical_trimp_per_min: number;
-  model_trimp_per_min: number;
-  global_fallback_rate: number;
-  days: { day_index: number; date: string | null; planned_minutes: number; predicted_trimp: number }[];
-  horizon_total_trimp: number;
-  observed_history: { date: string; training_trimp: number; training_minutes: number; trimp_per_min: number }[];
-  observed_median_trimp_per_min: number | null;
+export type Activity = "training" | "game" | "rest";
+export const PLANNING_FIELDS = [
+  "original_team", "original_extra", "other_recorded", "team_min", "team_max", "extra_min", "extra_max",
+  "ml_limit", "trimp_limit", "ml_buffer", "trimp_buffer", "weekly_ml_limit", "weekly_trimp_limit",
+] as const;
+export type PlanningKey = (typeof PLANNING_FIELDS)[number];
+export type Planning = Record<PlanningKey, number>;
+
+export interface PlanConfig {
+  athlete: string;
+  start: string;
+  planning: Planning;
+  schedule: Activity[];
+  step: 1 | 5 | 10;
+  objective: "terminal" | "cumulative";
+  allow_pooled: boolean;
+  overrides: Record<string, Partial<Planning>>;
 }
 
-export interface ForecastMeta {
-  known_athletes: string[];
-  validation: Record<string, unknown> & {
-    regression: { mae: number; rmse: number; bias: number };
-    athlete_history: { mae: number; rmse: number; bias: number };
-    pooled_history: { mae: number; rmse: number; bias: number };
-    train_n: number; test_n: number;
-  };
+export interface PlanMeta {
+  roster: { athlete_id: string; label: string; training_days: number; measured_mip_days: number; last_date: string | null }[];
+  first_start: string | null;
+  last_start: string | null;
+  schedule: Activity[];
+  fitting_period: { first_date: string; last_date: string };
+  demo: PlanConfig | null;
   scope: string;
+}
+
+export interface PlanHistory {
+  athlete_id: string;
+  label: string;
+  start: string;
+  week_dates: string[];
+  planning: Planning;
+  reason: string | null;
+  personalized: boolean;
+  in_fitting_period: boolean;
+  features: Record<string, number | null> | null;
+  history: { date: string; mip1: number | null; movement_load: number | null; training_trimp: number | null; recorded_duration_min: number | null }[];
+}
+
+export interface PlanDay {
+  day: number; date: string; kind: Activity; team: number; extra: number; duration: number | null;
+  mip1: number | null; movement_load: number | null; training_trimp: number | null; spline: number | null;
+}
+
+export interface PlanSummary {
+  plan: PlanDay[]; weekly_ml: number; weekly_trimp: number; ml_margin: number; trimp_margin: number;
+  day7_mip: number | null; mip_sum: number;
+}
+
+export interface PlanResult extends PlanSummary {
+  athlete: string; start: string; pooled: boolean; reason: string | null; objective: "terminal" | "cumulative";
+  original: { day: number; date: string; team: number; extra: number; duration: number; mip1: number | null; movement_load: number | null; training_trimp: number | null }[];
+  alternative: PlanSummary | null;
+  explanation: string;
+  limitation: string;
+}
+
+export interface ModelEvidence {
+  comparison: { target: string; specification: string; model: string; selected: boolean; parameters: string;
+    val_rmse: number; val_r2: number; val_n: number; test_mae: number; test_rmse: number; test_r2: number; test_n: number }[];
+  importance: { target: string; model: string; group: string; mean_delta_rmse: number; sd_delta_rmse: number }[];
 }
 
 export class ApiError extends Error {
@@ -276,8 +319,9 @@ export const api = {
   importFile: (file: File, year: number | null) => req<{ status: string }>("/api/imports", { method: "POST", body: form(file, year) }),
   importDemo: (year: number) => req<{ status: string }>(`/api/imports/demo${qs({ season_start_year: year })}`, { method: "POST" }),
   reset: () => req<unknown>("/api/store", { method: "DELETE" }),
-  forecastMeta: () => req<ForecastMeta>("/api/forecast/meta"),
-  forecast: (athlete: string, minutes: number[]) => req<ForecastResponse>(`/api/forecast/${athlete}${qs({ minutes: minutes.join(",") })}`),
+  planMeta: () => req<PlanMeta>("/api/plan/meta"),
+  planHistory: (athlete: string, start: string) => req<PlanHistory>(`/api/plan/history${qs({ athlete, start })}`),
+  planOptimize: (config: PlanConfig) =>
+    req<PlanResult>("/api/plan/optimize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(config) }),
+  planModels: () => req<ModelEvidence>("/api/plan/models"),
 };
-
-export const baselineUrl = (athlete: string, minutes: number[]) => `/api/forecast/${athlete}/baseline.json${qs({ minutes: minutes.join(",") })}`;

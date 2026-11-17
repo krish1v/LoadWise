@@ -22,7 +22,9 @@ FD_HEADERS = ["Athlete name", "Measurement type", "Analysis period", "Date", "Da
               "Measurement error (%)", "High intensity training (hh:mm:ss)", "TRIMP (Index)",
               "TRIMP/min (Index)", "Movement load", "Average movement intensity",
               "Average HR (bpm)", "Minimum HR (bpm)", "Peak HR (bpm)",
-              "Acute Training Load", "Chronic Training Load", "ACWR"]
+              "Acute Training Load", "Chronic Training Load", "ACWR",
+              "Maximal Intensity Period MI 1min", "Maximal Intensity Period MI 3min"]
+MIP1, MIP3 = "Maximal Intensity Period MI 1min", "Maximal Intensity Period MI 3min"
 WL_HEADERS = ["Date", "Performed By", "Fatig - #", "Sleep Qua - #", "Sleep Ti - #", "Sore - #",
               "Stre - #", "Wellness - Score"]
 
@@ -37,7 +39,7 @@ def session(athlete="Player A", mtype="Training", date="11/09", day=1, gd=None,
            "TRIMP (Index)": trimp, "TRIMP/min (Index)": 1.1, "Movement load": ml,
            "Average movement intensity": 0.9, "Average HR (bpm)": 120, "Minimum HR (bpm)": 60,
            "Peak HR (bpm)": 180, "Acute Training Load": 700, "Chronic Training Load": 800,
-           "ACWR": 0.875}
+           "ACWR": 0.875, MIP1: 6.0, MIP3: 5.0}
     row.update(extra)
     return row
 

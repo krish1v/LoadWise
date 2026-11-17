@@ -16,6 +16,9 @@ FIELD_DICTIONARY = {
         "trimp": "TRIMP index (source-defined, dimensionless)",
         "movement_load": "source-defined arbitrary units (AU)",
         "avg_movement_intensity": "source-defined; unit and vendor formula not established",
+        "mip1": "'Maximal Intensity Period MI 1min': peak 1-minute movement intensity, source-defined "
+                "unit. A per-session peak, so daily values are the max over sessions, never a sum",
+        "mip3": "'Maximal Intensity Period MI 3min': as mip1 over a 3-minute window",
         "efficiency": "Movement Load AU per TRIMP index point (daily, calculated)",
         "trimp_per_min": "TRIMP index per minute (daily, calculated); session values are source-reported",
         "measurement_error_pct": "percent points, interpreted from cell format and column header",
@@ -39,6 +42,9 @@ FIELD_DICTIONARY = {
         "no_sessions": "breakdown bucket has no sessions that day; value is null",
     },
     "metric_block": "{value, valid_sessions, expected_sessions, completeness}",
+    "peak_intensity": "dailyRecords[].peak_intensity.<mip1|mip3> is a metric block whose value is the "
+                      "MAX over included sessions that recorded it, plus by_bucket (training, game, "
+                      "other) blocks of the same shape.",
     "derived_ratios": "efficiency = total Movement Load / total TRIMP; trimp_per_min = total TRIMP / "
                       "total duration. Only when both inputs are complete over the same sessions and "
                       "the denominator > 0; otherwise value null with a reason. Session ratios are "
@@ -90,6 +96,7 @@ def daily_to_csv(daily: List[dict]) -> str:
         cols += [m, f"{m}_completeness", f"{m}_valid_sessions", f"{m}_expected_sessions"]
     for b in ("training", "game", "other"):
         cols += [f"{b}_{m}" for m in _METRICS]
+    cols += ["mip1_max", "mip1_completeness", "training_mip1_max", "mip3_max", "training_mip3_max"]
     cols += ["efficiency", "efficiency_null_reason", "trimp_per_min", "trimp_per_min_null_reason",
              "gd_labels", "gd_conflict", "wellness_observations", "flag_count", "source_record_ids",
              "excluded_record_ids"]
@@ -111,6 +118,11 @@ def daily_to_csv(daily: List[dict]) -> str:
                         f"{m}_expected_sessions": t["expected_sessions"]})
             for b in ("training", "game", "other"):
                 row[f"{b}_{m}"] = d["breakdown"][b][m]["value"]
+        for k in ("mip1", "mip3"):
+            p = d["peak_intensity"][k]
+            row[f"{k}_max"] = p["value"]
+            row[f"training_{k}_max"] = p["by_bucket"]["training"]["value"]
+        row["mip1_completeness"] = d["peak_intensity"]["mip1"]["completeness"]
         for r in ("efficiency", "trimp_per_min"):
             row[r] = d["derived"][r]["value"]
             row[f"{r}_null_reason"] = d["derived"][r]["reason"]

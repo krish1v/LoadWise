@@ -44,6 +44,7 @@ Values are JSON-safe: no NaN or Infinity, and dates are ISO strings. Ordering is
 | `metrics.movement_load` | source-defined AU | yes | |
 | `source_ratios.trimp_per_min` | TRIMP/min | yes | **Source-reported** session value; never averaged. |
 | `source_ratios.avg_movement_intensity` | source-defined, unit unknown | yes | Preserved as reported. |
+| `peak_intensity.{mip1, mip3}` | source-defined | yes | `Maximal Intensity Period MI 1min` / `3min`: the session's peak movement intensity over a 1- or 3-minute window. Negative values are nulled and flagged. |
 | `measurement_error_pct` | percent points | yes | Percent-formatted cells are stored fractions × 100; `measurement_error_interpretation` says which rule applied. |
 | `heart_rate.{min,avg,peak}_bpm` | bpm | yes | Screened only, never aggregated. |
 | `source_reported.{acute_training_load, chronic_training_load, acwr}` | source units | yes | Reference only. **Not calculated or verified.** |
@@ -70,6 +71,7 @@ Values are JSON-safe: no NaN or Infinity, and dates are ISO strings. Ordering is
 | `derived.efficiency` | Total Movement Load / total TRIMP |
 | `derived.trimp_per_min` | Total TRIMP / total duration (minutes) |
 | `source_session_ratios` | Source-reported session TRIMP/min, kept separately |
+| `peak_intensity.{mip1,mip3}` | Metric block whose `value` is the **max** over included sessions that recorded it (peaks are never summed), plus `by_bucket.{training,game,other}` blocks of the same shape |
 | `avg_movement_intensity` | `session_values` are preserved. `daily_value` is always `null`, because no justified aggregation method exists. |
 | `schedule` | `gd_labels` (all distinct), `gd_conflict`, `has_game_session` |
 | `wellness` | **List** of same-day wellness observations, never summed, chosen between or zero-filled |
@@ -129,4 +131,4 @@ Values are JSON-safe: no NaN or Infinity, and dates are ISO strings. Ordering is
 
 ## Daily CSV
 
-One row per daily record. For each metric there are four columns: `<metric>`, `<metric>_completeness`, `<metric>_valid_sessions` and `<metric>_expected_sessions`. Then come the `training_*`, `game_*` and `other_*` values, `efficiency` and `trimp_per_min` with `*_null_reason`, `gd_labels` (`|`-separated), `gd_conflict`, `wellness_observations`, `flag_count`, `source_record_ids` and `excluded_record_ids`. Empty cell = null.
+One row per daily record. For each metric there are four columns: `<metric>`, `<metric>_completeness`, `<metric>_valid_sessions` and `<metric>_expected_sessions`. Then come the `training_*`, `game_*` and `other_*` values, `mip1_max`, `mip1_completeness`, `training_mip1_max`, `mip3_max`, `training_mip3_max`, `efficiency` and `trimp_per_min` with `*_null_reason`, `gd_labels` (`|`-separated), `gd_conflict`, `wellness_observations`, `flag_count`, `source_record_ids` and `excluded_record_ids`. Empty cell = null.

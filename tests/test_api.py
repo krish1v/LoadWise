@@ -1,4 +1,4 @@
-"""API + SQLite store: demo import, re-upload no-op, drill-down, override, exports, forecast."""
+"""API + SQLite store: demo import, re-upload no-op, drill-down, override, exports, training planner."""
 
 import json
 import os
@@ -106,15 +106,26 @@ def test_reset_clears_store(client):
 
 
 @pytest.mark.skipif(not os.path.exists(REAL_WORKBOOK), reason="real workbook not present")
-def test_demo_and_forecast(client):
+def test_demo_and_training_planner(client):
     r = client.post("/api/imports/demo").json()
     assert r["summary"]["session_records"] == 1260
     squad = client.get("/api/summary").json()["squad"]
     assert len(squad["athletes"]) == 15 and squad["reference_date"] == "2026-01-09"
-    pytest.importorskip("sklearn")
-    aid = squad["athletes"][0]["athlete_id"]
-    fc = client.get(f"/api/forecast/{aid}?minutes=90,60").json()
-    assert len(fc["days"]) == 2 and fc["days"][0]["date"] > "2026-01-01"
-    assert fc["days"][0]["predicted_trimp"] > 0 and fc["observed_history"]
-    base = client.get(f"/api/forecast/{aid}/baseline.json?minutes=90").json()
-    assert base["kind"] == "expected_baseline_workload"
+
+    meta = client.get("/api/plan/meta").json()
+    assert len(meta["roster"]) == 15 and meta["last_start"] == "2026-01-10"
+    demo = meta["demo"]
+    hist = client.get(f"/api/plan/history?athlete={demo['athlete']}&start={demo['start']}").json()
+    assert hist["personalized"] and hist["in_fitting_period"] is False
+    assert hist["week_dates"][0] == "2025-12-16" and hist["history"][-1]["date"] < "2025-12-16"
+
+    plan = client.post("/api/plan/optimize", json=demo).json()
+    # The modelling team's reference result (prototype/check_setup.py), fed by LoadWise data.
+    assert plan["day7_mip"] == pytest.approx(8.036263368037119, abs=1e-6)
+    assert plan["weekly_ml"] == pytest.approx(1696.334456630421, abs=1e-5)
+    assert plan["weekly_trimp"] == pytest.approx(728.47, abs=0.01)
+    assert [d["date"] for d in plan["plan"]][-1] == "2025-12-22"
+
+    bad = client.post("/api/plan/optimize", json={**demo, "schedule": ["rest"] * 7})
+    assert bad.status_code == 400 and "training day" in bad.json()["detail"]
+    assert client.get("/api/plan/models").json()["comparison"]

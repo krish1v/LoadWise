@@ -15,7 +15,7 @@ import datetime as dt
 from collections import defaultdict
 from typing import Dict, List, Optional
 
-from .normalize import PRIMARY_METRICS
+from .normalize import PEAK_METRICS, PRIMARY_METRICS
 
 BUCKETS = ("training", "game", "other")
 
@@ -33,6 +33,22 @@ def metric_block(sessions: List[dict], key: str) -> dict:
         status = "missing"
     return {"value": sum(valid) if valid else None, "valid_sessions": len(valid),
             "expected_sessions": len(sessions), "completeness": status}
+
+
+def peak_block(sessions: List[dict], key: str) -> dict:
+    """Daily peak of a per-session peak metric: max over sessions that recorded it."""
+    vals = [s["peak_intensity"][key] for s in sessions]
+    valid = [v for v in vals if v is not None]
+    block = metric_block([{"metrics": {key: v}} for v in vals], key)
+    block["value"] = max(valid) if valid else None
+    return block
+
+
+def _peaks(recs: List[dict]) -> Dict[str, dict]:
+    return {k: {**peak_block(recs, k),
+                "by_bucket": {b: peak_block([r for r in recs if r["session_bucket"] == b], k)
+                              for b in BUCKETS}}
+            for k in PEAK_METRICS}
 
 
 def _blocks(sessions: List[dict]) -> Dict[str, dict]:
@@ -97,6 +113,7 @@ def build_daily_records(sessions: List[dict], wellness: List[dict]) -> List[dict
             "breakdown": breakdown,
             "reconciles": {k: _reconciles(totals[k], [breakdown[b][k] for b in BUCKETS])
                            for k in PRIMARY_METRICS},
+            "peak_intensity": _peaks(recs),
             "derived": {
                 "efficiency": derived_ratio(totals["movement_load"], totals["trimp"],
                                             "Movement Load", "TRIMP"),
