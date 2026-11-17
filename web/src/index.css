@@ -1,0 +1,89 @@
+@import "tailwindcss";
+@import "@fontsource/barlow-semi-condensed/400.css";
+@import "@fontsource/barlow-semi-condensed/500.css";
+@import "@fontsource/barlow-semi-condensed/600.css";
+@import "@fontsource/barlow-semi-condensed/700.css";
+
+/* Tokens. Data colours come from the validated dataviz palette; flags use the status palette only. */
+:root {
+  color-scheme: light;
+  --page: #f3f4f2;
+  --surface: #fcfcfb;
+  --surface-2: #eef0ed;
+  --ink: #13202c;
+  --ink-2: #4b5560;
+  --muted: #858b8f;
+  --line: #e1e0d9;
+  --line-strong: #c3c2b7;
+  --nav: #13202c;
+  --nav-ink: #c9d2da;
+  --training: #2a78d6;
+  --game: #eb6834;
+  --other: #6250d6;
+  --good: #0ca30c;
+  --warning: #fab219;
+  --serious: #ec835a;
+  --critical: #d03b3b;
+  --focus: #2a78d6;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0f1215;
+    --surface: #181b1e;
+    --surface-2: #20242a;
+    --ink: #eef0f2;
+    --ink-2: #b9c0c6;
+    --muted: #898781;
+    --line: #2c2f33;
+    --line-strong: #3d4246;
+    --nav: #0a0d10;
+    --nav-ink: #aeb8c1;
+    --training: #3987e5;
+    --game: #d95926;
+    --other: #9085e9;
+  }
+}
+
+@theme inline {
+  --font-sans: "Barlow Semi Condensed", system-ui, "Segoe UI", sans-serif;
+  --color-page: var(--page);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-nav: var(--nav);
+  --color-nav-ink: var(--nav-ink);
+  --color-training: var(--training);
+  --color-game: var(--game);
+  --color-other: var(--other);
+  --color-good: var(--good);
+  --color-warning: var(--warning);
+  --color-serious: var(--serious);
+  --color-critical: var(--critical);
+}
+
+html, body, #root { height: 100%; }
+body {
+  background: var(--page);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+.num { font-variant-numeric: tabular-nums; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 4px; }
+
+/* Partial data is hatched; unobserved is an empty dashed cell. Same language everywhere. */
+.hatch {
+  background-image: repeating-linear-gradient(135deg, currentColor 0 1.5px, transparent 1.5px 5px);
+}
+.unobserved { border: 1px dashed var(--line-strong); background: transparent; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}

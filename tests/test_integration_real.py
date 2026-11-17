@@ -1,10 +1,4 @@
-"""Integration smoke test against the supplied workbook (criterion-wide).
-
-Skips automatically if the real workbook is not present, so the suite still runs
-anywhere. The season year used here is the one configured for this project.
-"""
-
-from __future__ import annotations
+"""Smoke test on the supplied workbook (skipped if it is not present)."""
 
 import json
 import os
@@ -14,58 +8,44 @@ import pytest
 from loadwise import Config, process_workbook
 from conftest import REAL_WORKBOOK
 
-pytestmark = pytest.mark.skipif(not os.path.exists(REAL_WORKBOOK),
-                                reason="supplied workbook not present")
-
-SEASON_YEAR = 2025  # 2025-26 season, as configured for this project
+pytestmark = pytest.mark.skipif(not os.path.exists(REAL_WORKBOOK), reason="real workbook not present")
 
 
 @pytest.fixture(scope="module")
 def result():
-    return process_workbook(REAL_WORKBOOK, Config(season_start_year=SEASON_YEAR))
+    return process_workbook(REAL_WORKBOOK, Config(season_start_year=2025), generated_at="test")
 
 
-def test_record_and_athlete_counts(result):
+def test_structure_detected(result):
+    imp = result.output["importMetadata"]["imports"][0]
+    assert imp["full_day"]["header_row"] == 1 and imp["full_day"]["records"] == 1260
+    assert imp["wellness"]["header_row"] == 49 and imp["wellness"]["records"] == 11
+
+
+def test_counts_and_dates(result):
     s = result.output["summary"]
-    assert s["full_day_records"] == 1260
-    assert s["athletes"] == 15
-    assert s["wellness_records"] == 11
+    assert s["session_records"] == 1260 and s["athletes"] == 15
+    assert s["date_range"] == {"first": "2025-09-11", "last": "2026-01-09"}
+    assert s["flags"]["error"] == 0
 
 
-def test_date_range_resolves_sep_to_jan(result):
-    s = result.output["summary"]
-    assert s["date_range"]["first"] == "2025-09-11"
-    assert s["date_range"]["last"] == "2026-01-09"
-
-
-def test_multi_session_days_collapse(result):
-    multi = [d for d in result.daily_records if d["included_session_count"] > 1]
-    assert len(multi) == 142  # observed training+game / double-practice days
-
-
-def test_all_breakdowns_reconcile(result):
+def test_types_and_game_metrics_never_zero_filled(result):
+    types = {r["measurement_type"] for r in result.cleaned_records}
+    assert types == {"Training", "Game"}
+    games = [r for r in result.cleaned_records if r["measurement_type"] == "Game"]
+    assert any(r["metrics"]["movement_load"] is None for r in games)
     for d in result.daily_records:
-        assert all(d["breakdown_reconciles"].values()), d["daily_id"]
+        assert all(d["reconciles"].values())
+        if d["totals"]["movement_load"]["completeness"] == "missing":
+            assert d["totals"]["movement_load"]["value"] is None
 
 
-def test_game_records_have_no_movement_load_surface_as_partial(result):
-    # Game-only days should have movement_load missing/partial, not fabricated 0.
-    game_only = [d for d in result.daily_records
-                 if d["schedule_context"]["has_game"]
-                 and d["breakdown"]["training"]["trimp"]["expected_sessions"] == 0]
-    assert game_only, "expected at least one game-only day"
-    assert any(d["totals"]["movement_load"]["completeness"] in ("missing", "partial")
-               for d in game_only)
+def test_source_acwr_preserved_not_calculated(result):
+    rec = result.cleaned_records[0]
+    assert rec["source_reported"]["acwr"] is not None
+    assert "not calculated" in rec["source_reported"]["_note"]
+    assert not any("acwr" in k.lower() for k in result.daily_records[0])
 
 
-def test_output_is_strict_json(result):
-    js = result.to_json()
-    parsed = json.loads(js)
-    assert parsed["schemaVersion"]
-    assert len(parsed["dailyRecords"]) == len(result.daily_records)
-
-
-def test_real_workbook_idempotent():
-    a = process_workbook(REAL_WORKBOOK, Config(season_start_year=SEASON_YEAR)).to_json()
-    b = process_workbook(REAL_WORKBOOK, Config(season_start_year=SEASON_YEAR)).to_json()
-    assert a == b
+def test_json_serializes(result):
+    assert json.loads(result.to_json(include_raw=False))["schemaVersion"] == "1.0.0"

@@ -1,227 +1,207 @@
-"""Athlete-specific daily aggregation.
+"""Athlete-specific daily aggregation with explicit completeness, plus history and schedule context.
 
-One daily record per resolved (athlete, date), combining all INCLUDED sessions.
-Every additive metric carries explicit completeness (value, valid/expected
-session counts, status). Derived ratios are computed only from complete, matched
-inputs with a positive denominator -- never by averaging session ratios.
+Rules (see FIELD_DICTIONARY.md):
+- Additive metrics are summed independently over *included* sessions.
+- Every metric block reports value, valid_sessions, expected_sessions and completeness:
+  complete (all sessions have it) | partial (some do; value is the known sum) |
+  missing (none do; value null) | no_sessions (breakdown bucket has no sessions; value null).
+- Derived ratios are computed only from complete inputs over the same sessions with a
+  positive denominator. Session ratios are never averaged.
 """
 
 from __future__ import annotations
 
-import datetime as _dt
+import datetime as dt
+from collections import defaultdict
 from typing import Dict, List, Optional
 
-from . import schema
+from .normalize import PRIMARY_METRICS
 
-_EPS = 1e-9
+BUCKETS = ("training", "game", "other")
 
 
-def _aggregate_metric(sessions: List[dict], key: str) -> dict:
-    """Sum one additive metric across sessions, tracking completeness."""
-    expected = len(sessions)
-    contributing = [s["normalized"].get(key) for s in sessions]
-    valid = [v for v in contributing if v is not None]
-    valid_count = len(valid)
-    if valid_count == 0:
-        value, status = None, "missing"
-    elif valid_count == expected:
-        value, status = sum(valid), "complete"
+def metric_block(sessions: List[dict], key: str) -> dict:
+    vals = [s["metrics"][key] for s in sessions]
+    valid = [v for v in vals if v is not None]
+    if not sessions:
+        status = "no_sessions"
+    elif len(valid) == len(sessions):
+        status = "complete"
+    elif valid:
+        status = "partial"
     else:
-        value, status = sum(valid), "partial"
-    return {
-        "value": value,
-        "valid_sessions": valid_count,
-        "expected_sessions": expected,
-        "completeness": status,
-    }
+        status = "missing"
+    return {"value": sum(valid) if valid else None, "valid_sessions": len(valid),
+            "expected_sessions": len(sessions), "completeness": status}
 
 
-def _bucket_sessions(sessions: List[dict], bucket: str) -> List[dict]:
-    return [s for s in sessions if s["measurement_bucket"] == bucket]
+def _blocks(sessions: List[dict]) -> Dict[str, dict]:
+    return {k: metric_block(sessions, k) for k in PRIMARY_METRICS}
 
 
-def _metric_block(sessions: List[dict]) -> Dict[str, dict]:
-    return {key: _aggregate_metric(sessions, key) for key in schema.ADDITIVE_METRICS}
-
-
-def _reconciles(total: dict, parts: List[dict]) -> bool:
-    tv = total["value"] or 0.0
-    pv = sum((p["value"] or 0.0) for p in parts)
-    return abs(tv - pv) <= _EPS * max(1.0, abs(tv))
-
-
-def _derived_ratio(numer: dict, denom: dict, label: str) -> dict:
-    """Compute numer/denom only when BOTH are complete and denom.value > 0."""
+def derived_ratio(numer: dict, denom: dict, numer_name: str, denom_name: str) -> dict:
     if numer["completeness"] != "complete" or denom["completeness"] != "complete":
-        return {"value": None, "reason": f"inputs not complete over the same included sessions "
-                f"(numerator={numer['completeness']}, denominator={denom['completeness']})"}
+        return {"value": None, "reason": f"{numer_name} and {denom_name} are not both complete over "
+                                         "the same included sessions"}
     if denom["value"] is None or denom["value"] <= 0:
-        return {"value": None, "reason": "denominator is zero or non-positive"}
-    if numer["value"] is None:
-        return {"value": None, "reason": "numerator unavailable"}
+        return {"value": None, "reason": f"{denom_name} total is zero or negative"}
     return {"value": numer["value"] / denom["value"], "reason": None}
 
 
-def build_daily_records(full_day_records: List[dict],
-                        wellness_records: List[dict]) -> List[dict]:
-    """Build the chronological per-athlete daily dataset."""
-    # Group INCLUDED sessions by (athlete_id, date).
-    groups: Dict[tuple, List[dict]] = {}
-    for rec in full_day_records:
-        if rec["status"] != "included":
+def _reconciles(total: dict, parts: List[dict]) -> bool:
+    known = [p["value"] for p in parts if p["value"] is not None]
+    t = total["value"]
+    if t is None:
+        return not known
+    return abs(sum(known) - t) <= 1e-9 * max(1.0, abs(t)) and \
+        sum(p["valid_sessions"] for p in parts) == total["valid_sessions"]
+
+
+def build_daily_records(sessions: List[dict], wellness: List[dict]) -> List[dict]:
+    included: Dict[tuple, List[dict]] = defaultdict(list)
+    excluded: Dict[tuple, List[str]] = defaultdict(list)
+    for s in sessions:
+        if s["athlete_id"] is None or s["date"] is None:
             continue
-        if rec["athlete_id"] is None or rec["date_resolved"] is None:
-            continue
-        groups.setdefault((rec["athlete_id"], rec["date_resolved"]), []).append(rec)
+        key = (s["athlete_id"], s["date"])
+        (included[key].append(s) if s["status"] == "included" else excluded[key].append(s["record_id"]))
+    well: Dict[tuple, List[dict]] = defaultdict(list)
+    for w in wellness:
+        if w["status"] == "included":
+            well[(w["athlete_id"], w["date"])].append(w)
 
-    # Index wellness by (athlete_id, date) -- keep ALL observations.
-    wellness_by_key: Dict[tuple, List[dict]] = {}
-    for w in wellness_records:
-        if w["athlete_id"] is None or w["date_resolved"] is None:
-            continue
-        wellness_by_key.setdefault((w["athlete_id"], w["date_resolved"]), []).append(w)
-
-    daily: List[dict] = []
-    for (aid, date), sessions in groups.items():
-        sessions.sort(key=lambda s: (s.get("start_fraction") is None, s.get("start_fraction") or 0,
-                                     s["provenance"]["excel_row"]))
-        label = sessions[0]["athlete_label"]
-
-        total = _metric_block(sessions)
-        training = _metric_block(_bucket_sessions(sessions, "training"))
-        game = _metric_block(_bucket_sessions(sessions, "game"))
-        other = _metric_block(_bucket_sessions(sessions, "other"))
-
-        reconciliation = {
-            key: _reconciles(total[key], [training[key], game[key], other[key]])
-            for key in schema.ADDITIVE_METRICS
-        }
-
-        efficiency = _derived_ratio(total["movement_load"], total["trimp"], "efficiency")
-        trimp_per_min = _derived_ratio(total["trimp"], total["duration_min"], "trimp_per_min")
-
-        # Average movement intensity: preserve session values; NO daily aggregate.
-        ami_sessions = [
-            {"record_id": s["record_id"], "value": s["normalized"].get("avg_movement_intensity_source")}
-            for s in sessions
-        ]
-        ami_values = [a["value"] for a in ami_sessions if a["value"] is not None]
-        avg_movement_intensity = {
-            "daily_value": None,
-            "reason": "No justified aggregation method for Average Movement Intensity; "
-                      "session values preserved instead.",
-            "session_values": ami_sessions,
-            "session_mean_unweighted": (sum(ami_values) / len(ami_values)) if ami_values else None,
-        }
-
-        # Source-reported per-session ratios, preserved separately from calculated ones.
-        source_session_ratios = [
-            {"record_id": s["record_id"],
-             "trimp_per_min_source": s["normalized"].get("trimp_per_min_source"),
-             "source_acwr": s["source"].get("source_acwr"),
-             "source_acute_training_load": s["source"].get("source_acute_training_load"),
-             "source_chronic_training_load": s["source"].get("source_chronic_training_load")}
-            for s in sessions
-        ]
-
-        # Day index: keep only if all sessions agree.
-        day_indices = {s["day_index"] for s in sessions if s["day_index"] is not None}
-        if len(day_indices) == 1:
-            day_index, day_index_note = next(iter(day_indices)), None
-        elif len(day_indices) == 0:
-            day_index, day_index_note = None, "no study-day index on contributing sessions"
-        else:
-            day_index, day_index_note = None, f"conflicting study-day indices: {sorted(day_indices)}"
-
-        # GD labels / game context.
-        gd_labels = sorted({s["gd"] for s in sessions if s["gd"] is not None})
-        game_records = [s["record_id"] for s in sessions if s["measurement_bucket"] == "game"]
-        schedule = {
-            "gd_labels": gd_labels,
-            "gd_conflict": len(gd_labels) > 1,
-            "has_game": len(game_records) > 0,
-            "game_record_ids": game_records,
-            "note": "Observed GD/game context only; not a complete forward schedule.",
-        }
-
-        # Wellness observations for the day (all of them).
-        wells = wellness_by_key.get((aid, date), [])
-        wellness_obs = [
-            {"record_id": w["record_id"], "scores": w["scores"], "date_raw": str(w["date_raw"])}
-            for w in wells
-        ]
-
-        # Completeness metadata.
-        any_partial = any(total[k]["completeness"] == "partial" for k in schema.ADDITIVE_METRICS)
-        all_complete = all(total[k]["completeness"] == "complete" for k in schema.ADDITIVE_METRICS)
-        flag_ids = sorted({fid for s in sessions for fid in s["flags"]})
-
+    daily = []
+    for (aid, date), recs in sorted(included.items()):
+        recs = sorted(recs, key=lambda r: (r["start_time"] or "", r["record_id"]))
+        totals = _blocks(recs)
+        breakdown = {b: _blocks([r for r in recs if r["session_bucket"] == b]) for b in BUCKETS}
+        breakdown_counts = {b: sum(r["session_bucket"] == b for r in recs) for b in BUCKETS}
+        indices = {r["study_day_index"] for r in recs
+                   if r["study_day_index"] is not None and r.get("study_day_consistent", True)}
+        all_indices = {r["study_day_index"] for r in recs if r["study_day_index"] is not None}
+        gd_labels = sorted({r["gd"] for r in recs if r["gd"]})
+        flag_ids = sorted({f for r in recs for f in r["flag_ids"]})
+        partial = [k for k, b in totals.items() if b["completeness"] != "complete"]
         daily.append({
             "daily_id": f"{aid}:{date}",
             "athlete_id": aid,
-            "athlete_label": label,
+            "athlete_label": recs[0]["athlete_label"],
             "date": date,
-            "day_index": day_index,
-            "day_index_note": day_index_note,
-            "included_session_count": len(sessions),
-            "source_record_ids": [s["record_id"] for s in sessions],
-            "totals": total,
-            "breakdown": {"training": training, "game": game, "other": other},
-            "breakdown_reconciles": reconciliation,
+            "study_day_index": next(iter(indices)) if len(indices) == 1 and len(all_indices) == 1 else None,
+            "study_day_index_conflict": len(all_indices) > 1 or len(indices) != len(all_indices),
+            "session_count": len(recs),
+            "session_counts_by_type": breakdown_counts,
+            "source_record_ids": [r["record_id"] for r in recs],
+            "excluded_record_ids": sorted(excluded.get((aid, date), [])),
+            "totals": totals,
+            "breakdown": breakdown,
+            "reconciles": {k: _reconciles(totals[k], [breakdown[b][k] for b in BUCKETS])
+                           for k in PRIMARY_METRICS},
             "derived": {
-                "efficiency_calculated": efficiency,
-                "trimp_per_min_calculated": trimp_per_min,
-                "avg_movement_intensity": avg_movement_intensity,
+                "efficiency": derived_ratio(totals["movement_load"], totals["trimp"],
+                                            "Movement Load", "TRIMP"),
+                "trimp_per_min": derived_ratio(totals["trimp"], totals["duration_min"],
+                                               "TRIMP", "duration"),
             },
-            "source_session_ratios": source_session_ratios,
-            "wellness_observations": wellness_obs,
-            "schedule_context": schedule,
-            "completeness": {
-                "all_additive_complete": all_complete,
-                "any_partial": any_partial,
+            "source_session_ratios": [
+                {"record_id": r["record_id"], "trimp_per_min": r["source_ratios"]["trimp_per_min"]}
+                for r in recs],
+            "avg_movement_intensity": {
+                "session_values": [{"record_id": r["record_id"],
+                                    "value": r["source_ratios"]["avg_movement_intensity"]} for r in recs],
+                "daily_value": None,
+                "reason": "No documented aggregation method for this source-defined metric; "
+                          "session values are preserved instead.",
             },
-            "quality_flag_ids": flag_ids,
+            "schedule": {
+                "gd_labels": gd_labels,
+                "gd_conflict": len(gd_labels) > 1,
+                "has_game_session": breakdown_counts["game"] > 0,
+            },
+            "wellness": [{"record_id": w["record_id"], "excel_row": w["provenance"]["excel_row"],
+                          **w["values"]} for w in sorted(well.get((aid, date), []),
+                                                         key=lambda w: w["record_id"])],
+            "quality": {
+                "incomplete_metrics": partial,
+                "flag_ids": flag_ids,
+            },
         })
-
-    # Chronological order per athlete.
-    daily.sort(key=lambda d: (d["athlete_id"], d["date"]))
     return daily
 
 
-def build_athlete_history(daily_records: List[dict]) -> List[dict]:
-    """Expose observed dates and gaps per athlete for a future ACWR module.
+def _gaps(dates: List[str]) -> List[dict]:
+    gaps = []
+    ds = [dt.date.fromisoformat(d) for d in dates]
+    for a, b in zip(ds, ds[1:]):
+        if (b - a).days > 1:
+            gaps.append({"from": (a + dt.timedelta(days=1)).isoformat(),
+                         "to": (b - dt.timedelta(days=1)).isoformat(),
+                         "days": (b - a).days - 1, "status": "unobserved"})
+    return gaps
 
-    We never fabricate rest days: absent calendar dates between observations are
-    reported as explicit gaps so a downstream module can apply its own
-    (still-to-be-agreed) missing-day policy.
-    """
-    by_athlete: Dict[str, List[dict]] = {}
-    for d in daily_records:
-        by_athlete.setdefault(d["athlete_id"], []).append(d)
 
-    histories = []
-    for aid, recs in sorted(by_athlete.items()):
-        recs = sorted(recs, key=lambda r: r["date"])
-        observed = [r["date"] for r in recs]
-        gaps = []
-        for prev, cur in zip(recs, recs[1:]):
-            dp = _dt.date.fromisoformat(prev["date"])
-            dc = _dt.date.fromisoformat(cur["date"])
-            delta = (dc - dp).days
-            if delta > 1:
-                gaps.append({
-                    "after_date": prev["date"],
-                    "before_date": cur["date"],
-                    "missing_days": delta - 1,
-                    "note": "Unobserved dates -- NOT assumed to be rest or zero load.",
-                })
-        histories.append({
+def build_athletes(sessions: List[dict], wellness: List[dict], daily: List[dict]) -> List[dict]:
+    info: Dict[str, dict] = {}
+    for rec, sheet in [(s, "sessions") for s in sessions] + [(w, "wellness") for w in wellness]:
+        aid = rec["athlete_id"]
+        if aid is None:
+            continue
+        a = info.setdefault(aid, {"athlete_id": aid, "labels": set(), "raw_labels": set(),
+                                  "sheets": set(), "session_records": 0, "wellness_records": 0})
+        a["labels"].add(rec["athlete_label"])
+        a["raw_labels"].add(str(rec["source_values"].get("athlete")))
+        a["sheets"].add(sheet)
+        a["session_records" if sheet == "sessions" else "wellness_records"] += 1
+    by_athlete: Dict[str, List[str]] = defaultdict(list)
+    for d in daily:
+        by_athlete[d["athlete_id"]].append(d["date"])
+    out = []
+    for aid, a in info.items():
+        dates = sorted(by_athlete.get(aid, []))
+        out.append({
             "athlete_id": aid,
-            "athlete_label": recs[0]["athlete_label"],
-            "observed_dates": observed,
-            "observed_day_count": len(observed),
-            "first_date": observed[0] if observed else None,
-            "last_date": observed[-1] if observed else None,
-            "gaps": gaps,
+            "label": sorted(a["labels"])[0],
+            "source_label_variants": sorted(a["raw_labels"]),
+            "sheets": sorted(a["sheets"]),
+            "session_records": a["session_records"],
+            "wellness_records": a["wellness_records"],
+            "history": {
+                "first_date": dates[0] if dates else None,
+                "last_date": dates[-1] if dates else None,
+                "observed_days": len(dates),
+                "observed_dates": dates,
+                "gaps": _gaps(dates),
+                "gap_policy": "Gaps are days with no recorded session. They are NOT zero load and "
+                              "NOT confirmed rest days; downstream rolling metrics must choose a policy.",
+            },
         })
-    return histories
+    return sorted(out, key=lambda a: (a["label"].casefold(), a["athlete_id"]))
+
+
+def build_schedule_context(sessions: List[dict]) -> dict:
+    inc = [s for s in sessions if s["status"] == "included"]
+    dates = sorted({s["date"] for s in inc})
+    game_dates: Dict[str, set] = defaultdict(set)
+    gd_by_date: Dict[str, set] = defaultdict(set)
+    for s in inc:
+        if s["session_bucket"] == "game":
+            game_dates[s["date"]].add(s["athlete_id"])
+        if s["gd"]:
+            gd_by_date[s["date"]].add(s["gd"])
+    no_data = []
+    if dates:
+        d, end = dt.date.fromisoformat(dates[0]), dt.date.fromisoformat(dates[-1])
+        observed = set(dates)
+        while d <= end:
+            if d.isoformat() not in observed:
+                no_data.append(d.isoformat())
+            d += dt.timedelta(days=1)
+    return {
+        "note": "Observed context only: derived from recorded game sessions and GD labels. This is "
+                "not a complete or future schedule. Dates without data are unobserved, not confirmed rest.",
+        "observed_range": {"first": dates[0] if dates else None, "last": dates[-1] if dates else None},
+        "game_session_dates": [{"date": d, "athletes_with_game_session": len(a)}
+                               for d, a in sorted(game_dates.items())],
+        "gd_labels_by_date": {d: sorted(v) for d, v in sorted(gd_by_date.items())},
+        "team_dates_without_data": no_data,
+    }

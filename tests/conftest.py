@@ -1,94 +1,82 @@
-"""Shared pytest fixtures: tiny synthetic workbook builders for edge cases."""
+"""Synthetic workbook builder. Every fixture is small and explicitly labelled synthetic."""
 
 from __future__ import annotations
 
-import datetime as _dt
+import datetime as dt
+import io
 import os
+import sys
 
 import openpyxl
 import pytest
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-REAL_WORKBOOK = os.path.join(REPO_ROOT, "Data Set Georgia Tech_anonymized.xlsx")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
-# The minimal Full Day header set the parser maps. Extra columns are allowed and
-# preserved, but these are enough to exercise the core schema.
-FULLDAY_HEADERS = [
-    "Athlete name", "Measurement type", "Analysis period", "Date", "Day", "GD",
-    "Start time (hh:min:sec)", "End time (hh:min:sec)", "Duration (hh:mm:ss)",
-    "Measurement error (%)", "High intensity training (hh:mm:ss)",
-    "TRIMP (Index)", "TRIMP/min (Index)", "Movement load",
-    "Average movement intensity", "Average HR (bpm)", "Minimum HR (bpm)",
-    "Peak HR (bpm)", "ACWR",
-]
+from loadwise import Config  # noqa: E402
 
-WELLNESS_HEADERS = [
-    "Date", "Performed By", "Fatig - #", "Sleep Qua - #", "Sleep Ti - #",
-    "Sore - #", "Stre - #", "Wellness - Score",
-]
+REAL_WORKBOOK = os.path.join(ROOT, "Data Set Georgia Tech_anonymized.xlsx")
+
+FD_HEADERS = ["Athlete name", "Measurement type", "Analysis period", "Date", "Day", "GD",
+              "Start time (hh:min:sec)", "End time (hh:min:sec)", "Duration (hh:mm:ss)",
+              "Measurement error (%)", "High intensity training (hh:mm:ss)", "TRIMP (Index)",
+              "TRIMP/min (Index)", "Movement load", "Average movement intensity",
+              "Average HR (bpm)", "Minimum HR (bpm)", "Peak HR (bpm)",
+              "Acute Training Load", "Chronic Training Load", "ACWR"]
+WL_HEADERS = ["Date", "Performed By", "Fatig - #", "Sleep Qua - #", "Sleep Ti - #", "Sore - #",
+              "Stre - #", "Wellness - Score"]
 
 
-def _write_sheet(ws, headers, rows, header_row=1, duration_as_fraction=False):
-    """Write a header row (at header_row) and data rows below it.
+def session(athlete="Player A", mtype="Training", date="11/09", day=1, gd=None,
+            start=dt.time(9, 0), end=dt.time(10, 30), duration=0.0625, hit=dt.timedelta(minutes=5),
+            trimp=100.0, ml=200.0, **extra):
+    row = {"Athlete name": athlete, "Measurement type": mtype, "Analysis period": "Measurement",
+           "Date": date, "Day": day, "GD": gd, "Start time (hh:min:sec)": start,
+           "End time (hh:min:sec)": end, "Duration (hh:mm:ss)": duration,
+           "Measurement error (%)": 0.02, "High intensity training (hh:mm:ss)": hit,
+           "TRIMP (Index)": trimp, "TRIMP/min (Index)": 1.1, "Movement load": ml,
+           "Average movement intensity": 0.9, "Average HR (bpm)": 120, "Minimum HR (bpm)": 60,
+           "Peak HR (bpm)": 180, "Acute Training Load": 700, "Chronic Training Load": 800,
+           "ACWR": 0.875}
+    row.update(extra)
+    return row
 
-    Each row is a dict keyed by header name. Duration/time values:
-      * duration columns accept a float (day-fraction) or a timedelta.
-      * start/end time accept datetime.time.
-    """
-    for i, h in enumerate(headers, start=1):
-        ws.cell(row=header_row, column=i, value=h)
-    for j, row in enumerate(rows, start=header_row + 1):
-        for i, h in enumerate(headers, start=1):
-            if h in row:
-                ws.cell(row=j, column=i, value=row[h])
+
+def wellness(athlete="Player A", date="11/09", score=25):
+    return {"Date": date, "Performed By": athlete, "Fatig - #": 5, "Sleep Qua - #": 5,
+            "Sleep Ti - #": 6, "Sore - #": 4, "Stre - #": 5, "Wellness - Score": score}
 
 
-def build_workbook(path, fullday_rows, wellness_rows=None, *,
-                   fullday_header_row=1, wellness_header_row=1,
-                   include_wellness=True, fullday_headers=None):
-    """Create a synthetic .xlsx at ``path`` and return the path."""
+def build_workbook(sessions=None, wellness_rows=None, wellness_header_row=49, fd_headers=None,
+                   include_wellness=True, epoch1904=False, fd_sheet="Full Day") -> bytes:
     wb = openpyxl.Workbook()
+    if epoch1904:
+        wb.epoch = openpyxl.utils.datetime.CALENDAR_MAC_1904
     ws = wb.active
-    ws.title = "Full Day"
-    _write_sheet(ws, fullday_headers or FULLDAY_HEADERS, fullday_rows,
-                 header_row=fullday_header_row)
+    ws.title = fd_sheet
+    headers = fd_headers or FD_HEADERS
+    ws.append(headers)
+    for s in sessions or []:
+        ws.append([s.get(h) for h in headers])
+        r = ws.max_row
+        for col, h in enumerate(headers, 1):
+            if h == "Measurement error (%)":
+                ws.cell(r, col).number_format = "0.00 %"
+            if h == "Duration (hh:mm:ss)":
+                ws.cell(r, col).number_format = "[hh]:mm:ss"
     if include_wellness:
-        wsw = wb.create_sheet("Wellness")
-        _write_sheet(wsw, WELLNESS_HEADERS, wellness_rows or [],
-                     header_row=wellness_header_row)
-    wb.save(path)
-    return str(path)
+        wl = wb.create_sheet("Wellness")
+        for c, h in enumerate(WL_HEADERS, 1):
+            wl.cell(wellness_header_row, c, h)
+        for i, w in enumerate(wellness_rows or [], 1):
+            for c, h in enumerate(WL_HEADERS, 1):
+                wl.cell(wellness_header_row + i, c, w.get(h))
+        wl.cell(wellness_header_row + len(wellness_rows or []) + 5, 1).number_format = "0.00"  # blank tail
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 @pytest.fixture
-def mk_workbook(tmp_path):
-    """Factory fixture returning build_workbook bound to a tmp file."""
-    counter = {"n": 0}
-
-    def _factory(fullday_rows, wellness_rows=None, **kwargs):
-        counter["n"] += 1
-        p = tmp_path / f"wb_{counter['n']}.xlsx"
-        return build_workbook(str(p), fullday_rows, wellness_rows, **kwargs)
-
-    return _factory
-
-
-def row(**kwargs):
-    """Convenience: a Full Day row dict with sensible defaults."""
-    base = {
-        "Athlete name": "Player 01",
-        "Measurement type": "Training",
-        "Analysis period": "Measurement",
-        "Date": "11/09",
-        "Day": 1,
-    }
-    base.update(kwargs)
-    return base
-
-
-def td(seconds):
-    return _dt.timedelta(seconds=seconds)
-
-
-def tm(h, m, s=0):
-    return _dt.time(h, m, s)
+def cfg():
+    return Config(season_start_year=2025)

@@ -1,86 +1,112 @@
-"""Units and date-resolution edge cases (acceptance criteria 3, 4, 5, 10)."""
+"""Units and dates (acceptance criteria 3, 4, 5) — synthetic fixtures."""
 
-from __future__ import annotations
-
-import datetime as _dt
+import datetime as dt
 
 import pytest
 
-from loadwise import Config
-from loadwise.dates import resolve_date, rollover_preview
-from loadwise import units
+from loadwise import Config, SeasonYearRequired, process_workbook
+from loadwise.normalize import duration_to_minutes, percent, resolve_date, rollover_preview, to_number
+from conftest import build_workbook, session
 
 
-# --- #3: Excel duration fraction 0.0625 -> 90 minutes. ---
-def test_duration_fraction_0_0625_is_90_minutes():
-    assert units.duration_to_minutes(0.0625) == 90.0
+# --- 3. Excel duration 0.0625 -> 90 minutes --------------------------------
+def test_excel_fraction_is_90_minutes():
+    assert duration_to_minutes(0.0625) == (90.0, None)
 
 
-def test_duration_handles_timedelta_time_and_string():
-    assert units.duration_to_minutes(_dt.timedelta(seconds=11560)) == pytest.approx(192.6667, abs=1e-3)
-    assert units.duration_to_minutes(_dt.time(1, 30, 0)) == 90.0
-    assert units.duration_to_minutes("01:30:00") == 90.0
-    assert units.duration_to_minutes("01:30") == 90.0
-    assert units.duration_to_minutes(None) is None
-    assert units.duration_to_minutes("") is None
+@pytest.mark.parametrize("value,expected", [
+    (dt.timedelta(hours=1, minutes=30), 90.0),
+    ("1:30:00", 90.0),
+    ("01:30", 90.0),
+    (dt.time(1, 30), 90.0),
+    (0, 0.0),
+])
+def test_duration_formats(value, expected):
+    assert duration_to_minutes(value)[0] == pytest.approx(expected)
 
 
-# --- #10: missing is distinct from a valid zero. ---
-def test_zero_preserved_missing_is_none():
-    assert units.to_float(0) == 0.0
-    assert units.to_float(0.0) == 0.0
-    assert units.to_float(None) is None
-    assert units.to_float("") is None
-    assert units.to_float(float("nan")) is None
-    assert units.to_float(float("inf")) is None
-    assert units.duration_to_minutes(0.0) == 0.0  # valid zero duration, not missing
+def test_duration_keeps_full_precision():
+    assert duration_to_minutes(dt.timedelta(seconds=11560))[0] == pytest.approx(192.6666666666)
 
 
-def test_percent_interpretation_uses_format_then_context():
-    # Stored fraction with % format -> percentage points.
-    v, note = units.percent_from_cell(0.0213, "0.00\\ %", "Measurement error (%)")
-    assert v == pytest.approx(2.13, abs=1e-6)
-    assert note == "fraction_format_x100"
-    # No % format but (%) header + small magnitude -> treated as fraction.
-    v, note = units.percent_from_cell(0.42, "General", "Average %HRmax (%)")
-    assert v == pytest.approx(42.0)
-    assert note == "context_fraction_x100"
-    # No % format, large magnitude -> already percentage points.
-    v, note = units.percent_from_cell(42.0, "General", "Something (%)")
-    assert v == 42.0
-    assert note == "assumed_percentage_points"
+def test_duration_unusable_values_are_null():
+    assert duration_to_minutes(None) == (None, "missing")
+    assert duration_to_minutes("abc") == (None, "non_numeric")
 
 
-# --- #4: day/month resolution incl. Dec->Jan rollover with configured year. ---
-def test_day_month_rollover_with_season_year():
-    cfg = Config(season_start_year=2025)
-    assert resolve_date("11/09", cfg).iso == "2025-09-11"   # September -> start year
-    assert resolve_date("31/12", cfg).iso == "2025-12-31"   # December -> start year
-    assert resolve_date("09/01", cfg).iso == "2026-01-09"   # January -> rolls over
-    assert resolve_date("01/08", cfg).iso == "2026-08-01"   # Aug -> next year side
+def test_duration_through_pipeline_is_90(cfg):
+    res = process_workbook(build_workbook([session(duration=0.0625)]), cfg)
+    assert res.cleaned_records[0]["metrics"]["duration_min"] == pytest.approx(90.0)
 
 
-def test_rollover_preview_shows_mapping():
-    cfg = Config(season_start_year=2025)
-    prev = rollover_preview(cfg)
-    by_month = {p["month"]: p["year"] for p in prev}
-    assert by_month[9] == 2025 and by_month[12] == 2025
-    assert by_month[1] == 2026
-    # Preview is empty when year unknown (nothing invented).
-    assert rollover_preview(Config(season_start_year=None)) == []
+def test_numbers_and_zero():
+    assert to_number(0) == (0.0, None)
+    assert to_number("12,5") == (12.5, None)
+    assert to_number(float("nan"))[0] is None
+    assert to_number(float("inf")) == (None, "non_finite")
+    assert to_number("n/a") == (None, "non_numeric")
 
 
-# --- #5: missing year config -> actionable, not an invented year. ---
-def test_missing_year_does_not_invent():
-    cfg = Config(season_start_year=None)
-    r = resolve_date("11/09", cfg)
-    assert r.resolved is None
-    assert r.error == "season_year_not_configured"
+def test_percent_uses_format_and_header_context():
+    assert percent(0.0214, "0.00 %", "Measurement error (%)")[0] == pytest.approx(2.14)
+    # header says %, but cell is not %-formatted and already holds percent points
+    assert percent(21.76, "0", "Heart Rate Recovery (%) 30s")[0] == pytest.approx(21.76)
 
 
-def test_unparseable_and_invalid_dates():
-    cfg = Config(season_start_year=2025)
-    assert resolve_date("not-a-date", cfg).error.startswith("unparseable_date")
-    assert resolve_date("45/09", cfg).error.startswith("invalid_day")
-    assert resolve_date("11/13", cfg).error.startswith("invalid_month")
-    assert resolve_date(None, cfg).error == "missing_date"
+# --- 4. Day/month dates and the Dec -> Jan rollover --------------------------
+def test_rollover_uses_supplied_season_year():
+    c = Config(season_start_year=2025)
+    assert resolve_date("11/09", c)["iso"] == "2025-09-11"
+    assert resolve_date("31/12", c)["iso"] == "2025-12-31"
+    assert resolve_date("01/01", c)["iso"] == "2026-01-01"
+    assert resolve_date("09/01", c)["iso"] == "2026-01-09"
+
+
+def test_rollover_preview_lists_years_in_season_order():
+    rows = rollover_preview(["11/09", "05/12", "02/01"], Config(season_start_year=2025))
+    assert [(r["month_name"], r["resolved_year"]) for r in rows] == [
+        ("Sep", 2025), ("Dec", 2025), ("Jan", 2026)]
+
+
+def test_rollover_through_pipeline(cfg):
+    wb = build_workbook([session(date="31/12", day=1), session(date="01/01", day=2,
+                                                                start=dt.time(9), end=dt.time(10))])
+    dates = [r["date"] for r in process_workbook(wb, cfg).cleaned_records]
+    assert dates == ["2025-12-31", "2026-01-01"]
+
+
+def test_invalid_calendar_date_is_rejected_not_guessed(cfg):
+    res = process_workbook(build_workbook([session(date="31/02")]), cfg)
+    rec = res.cleaned_records[0]
+    assert rec["date"] is None and rec["status"] == "rejected"
+    assert any(f["rule_code"] == "MISSING_OR_INVALID_DATE" for f in res.quality_flags)
+
+
+def test_real_dates_and_1904_serials():
+    c = Config()   # no year needed for real dates
+    assert resolve_date(dt.datetime(2025, 10, 3, 23, 30), c)["iso"] == "2025-10-03"  # no tz shift
+    from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900
+    assert resolve_date(45000, c, CALENDAR_WINDOWS_1900)["iso"] == "2023-03-15"
+    assert resolve_date(45000 - 1462, c, CALENDAR_MAC_1904)["iso"] == "2023-03-15"
+
+
+# --- 5. Missing year -> actionable request, never an invented year -----------
+def test_missing_year_raises_actionable_error():
+    with pytest.raises(SeasonYearRequired) as e:
+        process_workbook(build_workbook([session()]), Config())
+    assert "season start year" in str(e.value)
+    assert str(dt.date.today().year) not in str(e.value)
+
+
+def test_date_dayindex_conflict_is_flagged(cfg):
+    rows = [session(date="11/09", day=1), session(athlete="Player B", date="12/09", day=1)]
+    res = process_workbook(build_workbook(rows), cfg)
+    assert any(f["rule_code"] == "DATE_DAYINDEX_CONFLICT" for f in res.quality_flags)
+
+
+def test_midnight_crossing_is_flagged_and_attributed_to_start_date(cfg):
+    res = process_workbook(build_workbook([session(start=dt.time(23, 0), end=dt.time(0, 30))]), cfg)
+    rec = res.cleaned_records[0]
+    assert rec["crosses_midnight"] and rec["clock_span_min"] == pytest.approx(90)
+    assert rec["date"] == "2025-09-11"
+    assert any(f["rule_code"] == "MIDNIGHT_CROSSING" for f in res.quality_flags)

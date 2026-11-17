@@ -1,184 +1,116 @@
-# LoadWise — Workload Ingestion & Daily Aggregation (Prototype)
+# LoadWise
 
-LoadWise is the **data layer** of a basketball workload-monitoring prototype
-(university project, Bamberg Baskets context). It ingests a Polar/"Full Day"
-Excel export, standardizes it, validates it, and produces an **athlete-specific
-daily dataset** plus a stable, versioned JSON/CSV output contract.
+Athlete workload monitoring prototype (university project, Bamberg Baskets context).
 
-This layer is intentionally **model-independent**: it does **no** optimization,
-injury prediction, readiness scoring, or training recommendations. Teammates
-building the Athlete-State and optimization components consume its output.
+This repository holds the **data layer** and the **web UI** built around it:
 
-> **Scope note on ACWR / workload estimates:** source-reported ACWR, Acute
-> Training Load and Chronic Training Load are preserved **as source-reported
-> fields only** — they are *not* treated as independently calculated. LoadWise
-> provides clean historical daily data (observed dates + explicit gaps) for a
-> **future, separate ACWR module** whose window definitions and missing-day
-> policy still need to be agreed (see `ASSUMPTIONS.md`).
+- `loadwise/`: a pure-Python library. It reads the per-session Excel export, standardizes and validates it, and produces **one record per athlete per day**, with explicit completeness and full provenance. It is model-independent: no optimization, injury prediction, readiness or recommendations.
+- `api/`: a small FastAPI service. It stores uploads in SQLite so athlete histories build up over time.
+- `web/`: a React app with squad overview, athlete timelines, a season calendar heatmap, daily data, data quality review and the training-load forecast.
 
----
+> **ACWR scope.** Source-reported ACWR, Acute Training Load and Chronic Training Load are preserved **as source-reported fields only**. They are never recalculated or treated as validated. LoadWise provides clean daily histories (observed dates plus explicit gaps) for a **future, separate ACWR module**. Its window definitions and missing-day policy still need agreement (see `ASSUMPTIONS.md`).
 
-## 1. Setup
+## Setup
 
-Requires Python 3.10+.
+Requires Python 3.10+ and Node 18+.
 
 ```bash
 pip install -r requirements.txt
+cd web && npm install && npm run build && cd ..
 ```
 
-## 2. Run the UI
+## Run
 
 ```bash
-streamlit run app/streamlit_app.py
+uvicorn api.main:app            # http://localhost:8000  (API + built UI)
 ```
 
-The app **auto-loads the bundled example workbook on startup** (season year
-2025) — no clicks needed. The sidebar switches the data source (example dataset
-or an uploaded `.xlsx`), sets the season start year, and exposes the screening
-thresholds; changing any of these reprocesses automatically.
+- **First start:** if the store is empty, the bundled demo workbook is imported automatically with season start year **2025**, so the UI opens with data. Set `LOADWISE_AUTOLOAD_DEMO=0` to disable this.
+- **Database:** history lives in `data/loadwise.db`. Override the location with `LOADWISE_DB=...`.
+- **Front-end development:** run `uvicorn api.main:app --reload` and `cd web && npm run dev` (http://localhost:5173 proxies `/api`).
 
-Four tabs:
+### Using the UI
 
-- **Overview & import** — headline metrics, the inferred Sep→Jan year rollover
-  to review, the detected sheets/headers (with the Wellness header found on row
-  49), and any date / study-day conflicts.
-- **Validation** — counts (records, athletes, dates, errors, warnings, excluded
-  duplicates), a filterable issue table, side-by-side source-vs-normalized
-  inspection, and include/exclude duplicate controls that recalculate the
-  affected daily outputs.
-- **Daily dataset** — filter by athlete and date range; a table emphasizing
-  TRIMP, Movement Load, High-Intensity minutes, duration and training/game
-  splits with visible partial-data indicators; drill-down into the contributing
-  sessions and source rows; download the JSON and daily CSV.
-- **Forecast** — the Option B **prediction layer** wired in (see below).
+| View | What it is for |
+|---|---|
+| **Add data** (top bar) | Drag in an `.xlsx` (or use the demo) and set the season start year. Review the detected sheets, header rows and how yearless dates resolve, then click **Process workbook**. Re-adding a file already stored changes nothing. |
+| **Squad** | Every athlete with a 28-day daily load strip (training blue, game orange, partial hatched, no data dashed), 7/28-day sums and issue counts. Move the window with *Window ends*. |
+| **Athlete** | The full-season daily timeline (training/game stacked, gaps shaded, partial days striped) and the athlete's daily table. Click any bar or row to open the drill-down. |
+| **Calendar** | Squad × date heatmap for one metric, with game days marked. |
+| **Daily data** | Filter by athlete, date range, partial days, multi-session days or days with issues. Download the daily CSV or the full JSON. |
+| **Data quality** | Counts (records, athletes, resolved dates, errors, warnings, excluded duplicates), the duplicate review queue (count it / leave it out, with a required reason; totals recalculate), the filterable issue table, a side-by-side original-vs-normalized record inspector, and the imported files with *Clear history*. |
+| **Forecast** | The teammate's Option B model: planned training minutes in, predicted training TRIMP out, drawn on top of recorded history. Shows its validation figures and exports the `expected_baseline_workload` JSON for the optimizer. |
 
-Theme is set in `.streamlit/config.toml`.
+The **drill-down drawer** (from any chart, table row or calendar cell) shows one athlete-day:
+- totals and training/game/other splits, each with coverage
+- calculated Efficiency and TRIMP/min, or the reason they are null
+- every contributing session, with file, sheet and Excel row, its flags and the original cell values
+- excluded copies
+- same-day wellness observations
 
-## Forecast layer (Option B prediction model)
-
-The teammate-built workload prediction module is connected through
-`loadwise/forecast.py`, which loads the trained artifact in `forecast/`
-(`loadwise_model.joblib`) and exposes a small, UI-agnostic API:
+## Use the library directly
 
 ```python
-from loadwise.forecast import Forecaster
-fc = Forecaster()
-fc.forecast("Player 01", [90, 90, 75, 0, 90, 60, 0])   # 7-day training-TRIMP forecast
-fc.baseline_export("Player 01", [90, 90])              # JSON hand-off to the optimizer
+from loadwise import Config, process_workbook, preview_workbook
+
+result = process_workbook("Data Set Georgia Tech_anonymized.xlsx", Config(season_start_year=2025))
+result.daily_records            # one dict per athlete-day
+result.quality_flags            # structured flags
+result.to_json()                # versioned JSON contract (see FIELD_DICTIONARY.md)
+result.to_json(include_raw=False)
+result.to_daily_csv()           # flat daily table with completeness columns
+
+# manual duplicate decisions (reason required in the UI/API); only the fast steps re-run
+result = result.reprocess({"<record_id>": {"action": "exclude", "reason": "recorded twice"}})
+
+# several files at once (identical files are read once; identical rows count once)
+process_workbook([("a.xlsx", bytes_a), ("b.xlsx", bytes_b)], Config(season_start_year=2025))
 ```
 
-It is one athlete-aware Ridge regression:
-`predicted session TRIMP = planned duration (min) × max(0, learned TRIMP/min)`,
-where the rate is learned from (athlete historical TRIMP/min, athlete identity).
-Unseen athletes fall back to the global median rate (cold start). The model is
-**consumed as-is**, not re-trained here. The Forecast tab shows the held-out
-validation metrics (Ridge vs. athlete-history vs. pooled baselines), the
-validation chart, comparable game-day history (context only), and a **download
-of the standardized `expected_baseline_workload` JSON** — the contract this
-layer passes to the future optimization layer. The tab also shows LoadWise's
-*own* observed median training TRIMP/min next to the model's, making the
-data-layer → prediction-layer link explicit.
+- A missing season year raises `SeasonYearRequired`, which carries an actionable message. LoadWise never guesses a year.
+- Unusable input raises `LoadWiseInputError` with a user-facing message. That covers empty files, non-xlsx files, a missing `Full Day` sheet and missing athlete/date columns.
 
-Scope: it predicts upcoming **training** TRIMP only — not games, injuries,
-readiness, or high-speed running. See `forecast/OptionB_Milestone_Brief.md` for
-the method, honest limitations, and the exploratory (not confirmatory) framing
-of its accuracy advantage.
+## API
 
-## 3. Use it as a library
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/status` | imports, season year, summary |
+| POST | `/api/preview`, GET `/api/preview/demo` | sheets, header rows, date samples, rollover table (nothing stored) |
+| POST | `/api/imports` (multipart `file`, `season_start_year`), `/api/imports/demo` | validate, store, recompute |
+| DELETE | `/api/imports/{sha256}`, `/api/store` | remove one file / clear history |
+| GET | `/api/summary?ref=YYYY-MM-DD` | summary + squad overview + schedule context |
+| GET | `/api/athletes`, `/api/daily?athlete=&date_from=&date_to=` | athletes with histories; daily rows |
+| GET | `/api/daily/{athlete_id}/{date}` | drill-down: daily record, sessions + raw cells, flags |
+| GET | `/api/calendar?metric=trimp` | athlete × date matrix (null = unobserved) |
+| GET | `/api/flags`, `/api/records/{record_id}`, `/api/review` | issues, record inspector, duplicate queue |
+| POST/DELETE | `/api/overrides` | include/exclude with reason; clear |
+| GET | `/api/export.json?include_raw=`, `/api/export.csv` | downloads |
+| GET | `/api/forecast/meta`, `/api/forecast/{athlete_id}?minutes=90,60,…`, `…/baseline.json` | prediction layer |
 
-The entire pipeline is reusable without the UI:
+Interactive docs: http://localhost:8000/docs
 
-```python
-from loadwise import Config, process_workbook
-
-result = process_workbook(
-    "Data Set Georgia Tech_anonymized.xlsx",
-    Config(season_start_year=2025),         # REQUIRED: never guessed
-)
-
-result.output          # JSON-safe dict (the full output contract)
-result.daily_records   # list of per-athlete/day records
-result.quality_flags   # structured validation flags
-result.to_json()                 # versioned JSON string
-result.to_json(include_raw=False)  # lighter JSON (raw dump replaced by counts)
-result.to_daily_csv()            # flattened daily CSV (with completeness columns)
-```
-
-A missing season year raises `loadwise.SeasonYearRequired` with an actionable
-message instead of inventing a year.
-
-## 4. Run the tests
+## Tests
 
 ```bash
-pytest -q
+pytest -q                  # 72 tests, ~45 s
+cd web && npm run build    # includes the TypeScript type-check
 ```
 
-Small synthetic fixtures exercise every edge case (criteria 1–15 in the brief);
-an integration smoke test runs the supplied workbook (auto-skips if absent).
+- **Synthetic fixtures** (built in `tests/conftest.py`) cover every acceptance criterion: same-day sessions, splits that reconcile, `0.0625` → 90 min, the Dec→Jan rollover, the missing-year request, the Wellness header below blank rows, exact and possible duplicates, idempotency, missing vs zero, partial coverage, isolation of invalid fields, ratio rules, graceful failures, and JSON traceability.
+- **Real-workbook test:** `tests/test_integration_real.py` smoke-tests the supplied workbook.
+- **API test:** `tests/test_api.py` drives the API and store, including the re-upload no-op, overrides, exports and the forecast.
 
----
-
-## Architecture
-
-Processing logic is fully separated from the UI so other apps can reuse it.
+## Layout
 
 ```
-loadwise/
-  config.py       Config + conservative, overridable screening Thresholds
-  schema.py       column↔key mapping + the machine-readable FIELD_DICTIONARY
-  identity.py     deterministic, stable, non-fuzzy athlete-id assignment
-  units.py        duration→minutes, format/context-aware percentages, safe floats
-  dates.py        yearless day/month → YYYY-MM-DD with reviewable rollover
-  ingest.py       openpyxl read, header DETECTION, raw records + provenance
-  normalize.py    standardize into normalized records (source preserved)
-  validate.py     structured, severity-tagged quality flags
-  duplicates.py   exact-duplicate canonicalization + overlap detection
-  aggregate.py    athlete/day aggregation with explicit completeness + history
-  export.py       JSON-safe output contract + flattened daily CSV
-  pipeline.py     end-to-end orchestration + manual include/exclude override
-app/streamlit_app.py   thin 3-view UI (presentation only)
-tests/                 synthetic-fixture unit tests + real-workbook integration
-sample_output/         sample JSON + CSV generated from the real workbook (year=2025)
+loadwise/   config · ingest · normalize · validate · aggregate · export · pipeline · store · forecast
+api/        main.py (FastAPI)
+web/        Vite + React + TypeScript (Tailwind, TanStack Query/Table, ECharts)
+scripts/    generate_sample_output.py
+sample_output/   JSON + daily CSV from the real workbook (season year 2025, set explicitly)
+forecast/   the teammate's trained model, validation results and brief
 ```
 
-### Key guarantees
+The pipeline is a pure function of (file bytes, config, overrides). The SQLite store keeps only those inputs and recomputes from them, so every number in the UI can be reproduced from the files.
 
-- **Raw records are immutable** and retain file / sheet / Excel-row provenance.
-- **Header positions and row counts are detected, never hardcoded** (so the
-  Wellness header on row 49 above blank rows is found automatically).
-- **`null` means missing/unusable; valid zeros are preserved.**
-- **Determinism / idempotency:** stable IDs + deterministic ordering mean
-  reprocessing the same file yields byte-identical JSON (the import timestamp is
-  injected by the caller, not read from the clock).
-- **Completeness is explicit:** every additive daily metric reports
-  `{value, valid_sessions, expected_sessions, completeness}` where completeness
-  is `complete` / `partial` / `missing`.
-- **Derived ratios** (Efficiency = ΣMovementLoad/ΣTRIMP, TRIMP/min =
-  ΣTRIMP/Σduration) are computed **only** from complete, matched inputs with a
-  positive denominator — session ratios are never averaged. Source-reported
-  ratios are kept separately.
-
-See `FIELD_DICTIONARY.md` for field-level units, nullability and semantics, and
-`ASSUMPTIONS.md` for unresolved questions.
-
-## Output contract (JSON)
-
-Top-level keys: `schemaVersion`, `importMetadata`, `configuration`,
-`fieldDictionary`, `athletes`, `rawRecords`, `cleanedRecords`, `dailyRecords`,
-`wellnessRecords`, `scheduleContext`, `qualityFlags`, `summary`.
-
-Rejected and excluded records are retained with their status and reasons; every
-daily total is traceable through `source_record_ids` → `cleanedRecords` →
-`provenance.excel_row`, plus the duplicate decision that produced it.
-
-## Observed facts about the supplied workbook
-
-- `Full Day`: 1,260 measurement rows, 15 anonymized athletes; `Measurement type`
-  ∈ {Training, Game}; `Analysis period` = Measurement throughout.
-- Dates are **text** day/month (`11/09`), running `2025-09-11` → `2026-01-09`
-  under season year 2025.
-- **Game records carry no Movement Load or High-Intensity value** (158 games +
-  54 trainings → 212 each are missing). LoadWise surfaces these as
-  `MISSING_PRIMARY_METRIC` warnings and as `partial`/`missing` daily totals —
-  it never fabricates a zero.
-- `Wellness`: header on Excel row 49, 11 records, trailing blank rows.
+See `FIELD_DICTIONARY.md` for the output contract and `ASSUMPTIONS.md` for open questions.

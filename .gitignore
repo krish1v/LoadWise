@@ -10,7 +10,12 @@ __pycache__/
 venv/
 env/
 
+# Frontend
+web/node_modules/
+web/dist/
+
 # Runtime / local
-streamlit_run.log
+data/*.db
+*.log
 .DS_Store
 Thumbs.db

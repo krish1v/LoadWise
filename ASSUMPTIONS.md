@@ -1,82 +1,38 @@
-# Unresolved Assumptions & Open Questions
+# Unresolved assumptions and open questions
 
-This prototype deliberately flags — rather than silently resolves — anything it
-cannot establish from the source. These need agreement with the S&C coach / team
-before the downstream Athlete-State and ACWR modules rely on them.
+These need agreement with the coach or the teammates. Each item says what LoadWise does today.
 
-## 1. Wellness scales (highest priority)
+## Dates
+- **Season year.** The export stores `dd/mm` with no year. LoadWise requires `season_start_year` and never infers it. The sample output and the demo use **2025** (2025–26 season), chosen explicitly by the project owner. Months from July (`rollover_month = 7`) get the start year; January to June get the next year. In the supplied workbook this means Sep–Dec 2025 and Jan 2026. Is July the right cut-over for this club's season?
+- **Checks that are evidence only.** The study-day index (`Day`) and the chronological row order are used as supporting evidence: a conflict is flagged and the year is never reassigned. In the supplied workbook every study-day index maps to exactly one date.
+- **Midnight crossings.** A session whose end time is earlier than its start time is attributed entirely to its **start date**. Splitting load across two days was not attempted.
+- **Two sessions where times and duration disagree** (Excel rows 829 and 937) are flagged. The duration column is used for totals.
 
-- The wellness columns (`Fatig - #`, `Sleep Qua - #`, `Sleep Ti - #`,
-  `Sore - #`, `Stre - #`, `Wellness - Score`) have **unknown scale, direction
-  and units**. Observed integers sit around 3–7 with a composite score ~24–31.
-- We do **not** assume higher = better (or worse), and we do **not** assume
-  `Sleep Ti - #` is sleep duration in hours.
-- The supplied workbook has only **11 wellness rows for a single day (11/09)**,
-  all for different athletes — far too sparse to infer a scale empirically.
-- **Action:** confirm each field's scale, direction, and unit; confirm whether
-  `Wellness - Score` is a sum of the components or an independent metric.
+## Wellness
+- The scale, range, direction (is higher better?) and units of `Fatig - #`, `Sleep Qua - #`, `Sleep Ti - #`, `Sore - #`, `Stre - #` and `Wellness - Score` are **unknown**. Values are stored as recorded and never rescaled, inverted or summed. `Sleep Ti - #` is **not** treated as hours of sleep.
+- The supplied workbook has only 11 wellness rows, all from one day.
 
-## 2. Average Movement Intensity semantics
+## Workload metrics
+- **Average Movement Intensity:** its unit and vendor formula are not established. Session values are preserved. No daily aggregate is produced, and LoadWise does not assume it equals Movement Load ÷ duration.
+- **Movement Load** is treated as source-defined arbitrary units and **TRIMP** as a source index. Neither vendor formula is reproduced.
+- **Game sessions** in the supplied export have no Movement Load or High-Intensity values (158 games). Those daily metrics are therefore partial or missing on game days, never zero. This is flagged as info (`METRIC_NOT_RECORDED_FOR_TYPE`), because it is a property of the export. Should game Movement Load come from another source?
+- **Screening thresholds** (duration 1–300 min, HR 30–230 bpm, etc.) are conservative placeholders, not physiological limits. A minimum HR of 29 bpm (row 366) is flagged as unusual, not as an error.
 
-- Preserved exactly as reported per session. We make **no claim** that it equals
-  Movement Load ÷ duration, and we produce **no daily aggregate** for it because
-  no aggregation method can currently be justified.
-- An unweighted session mean is provided *for reference only*
-  (`session_mean_unweighted`) and must not be treated as authoritative.
-- **Action:** obtain the vendor definition; decide whether a duration-weighted
-  daily value is appropriate, and document the formula if so.
+## Duplicates and multiple files
+- An **exact duplicate** means every source cell is identical. A **possible duplicate** means the same athlete and date, with sessions that overlap by ≥ 50% or start at the same time. Same athlete and same date alone is never treated as a duplicate.
+- When several files are stored, identical rows across files are counted once (the earliest import wins). A changed re-export of the same sessions with different values would show up as possible duplicates, not be merged silently. A "replace this file" workflow may be needed later.
+- All stored files must share one season start year. Starting another season requires clearing the history.
 
-## 3. Date interpretation
+## ACWR and rolling metrics (future module)
+- Source ACWR, Acute Training Load and Chronic Training Load are preserved for reference only. They are **not recalculated**, and LoadWise does not know the source's window lengths or method.
+- A separate ACWR module must still agree on:
+  - which load metric to use (TRIMP? Movement Load? both?)
+  - acute and chronic window lengths, and rolling-average vs EWMA
+  - the **missing-day policy**: days without data are exposed as unobserved gaps, not zeros, and the module must decide whether a gap is rest, unknown, or imputed
+  - how to treat partial days (e.g. game days without Movement Load)
+- The squad view's 7/28-day sums are display only. They sum the known values over observed days and are not ACWR.
 
-- Dates are text day/month with no year. Resolution **requires** an explicit
-  season start year; the prototype is configured with **2025** (the 2025–26
-  season: Sep–Dec 2025, Jan 2026). It never defaults to the current year.
-- Rollover rule currently: months 9–12 → start year, months 1–8 → start year+1.
-  This matches the observed Sep→Jan span but the exact season boundary month is
-  an assumption.
-- Resolved dates are cross-checked against the sequential `Day` study-index;
-  disagreements are flagged (`DATE_DAYINDEX_CONFLICT`), **not** auto-corrected.
-- **Action:** confirm the season start year and the rollover boundary; decide a
-  policy if any date/day-index conflicts are reported for a future workbook.
-
-## 4. Future ACWR methodology (separate module)
-
-- Source-reported `ACWR`, `Acute Training Load` and `Chronic Training Load` are
-  preserved **as source-reported fields only** — never recomputed here.
-- LoadWise supplies clean, chronologically sorted daily histories per athlete,
-  with **observed dates and explicit gaps** exposed. Unobserved dates are **not**
-  assumed to be rest or zero load.
-- Still to agree for the independent ACWR module:
-  - Acute vs chronic **window definitions** (e.g. 7-day acute vs 28-day chronic;
-    rolling vs EWMA).
-  - **Missing-day policy** — are gaps treated as zero load, carried forward,
-    ignored, or do they invalidate the window?
-  - Which workload metric drives ACWR (TRIMP? Movement Load? both?).
-
-## 5. Duplicate / overlap policy
-
-- "Exact duplicate" = an identical copy across **all** source columns; one
-  canonical record is kept and the rest excluded from totals (this also makes
-  re-uploads idempotent).
-- Same athlete + same date is explicitly **not** a duplicate — double practices
-  and training+game days are legitimate and kept.
-- Time-window overlap above `overlap_warn_fraction` (default 0.5) is flagged as a
-  **possible** duplicate but kept **included** pending human review.
-- **Action:** confirm the overlap threshold and whether any genuinely duplicated
-  sessions exist in practice.
-
-## 6. Screening thresholds
-
-- Duration (1–300 min), HR (20–230 bpm), and workload-magnitude ceilings are
-  conservative **screening** values that raise warnings only — they never
-  reclassify a value as a hard error.
-- **Action:** calibrate with the coach (e.g. realistic max game/practice length,
-  player-specific HR maxima).
-
-## 7. Observed data quirk (not an assumption, but flag for the team)
-
-- In the supplied workbook, **Game records contain no Movement Load or
-  High-Intensity value** (212 records each). Daily Movement Load / Efficiency on
-  game-only days is therefore `missing`/`partial`, by design — not zero.
-- **Action:** confirm whether this is expected (Movement Load unavailable for
-  games) or a source-export gap to be fixed upstream.
+## Forecast layer
+- The Forecast view consumes the modelling team's trained artifact (`forecast/loadwise_model.joblib`) as-is. It predicts **training** TRIMP from planned minutes only, not games, injury or readiness.
+- Forecast days start the day after the athlete's last recorded session. Athletes missing from the model's training data (e.g. Player 15) fall back to the squad rate.
+- Its accuracy figures come from a 50-session holdout and should be treated as exploratory.

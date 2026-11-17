@@ -1,20 +1,13 @@
-"""LoadWise -- basketball workload ingestion, validation and daily aggregation.
+"""LoadWise data layer: Excel ingestion, validation and athlete-specific daily aggregation.
 
-This package is the *data layer* only. It is intentionally free of any UI,
-optimization, injury-prediction, readiness or recommendation logic so that the
-Athlete-State and optimization components being built by teammates can reuse it.
-
-Public entry point: :func:`loadwise.pipeline.process_workbook`.
+Model-independent: no optimization, injury prediction, readiness or recommendations,
+and no recalculated ACWR (source ACWR is preserved as source-reported only).
 """
 
-from .config import Config, Thresholds, SCHEMA_VERSION
-from .pipeline import process_workbook, ProcessResult, SeasonYearRequired
+__version__ = "1.0.0"
 
-__all__ = [
-    "Config",
-    "Thresholds",
-    "SCHEMA_VERSION",
-    "process_workbook",
-    "ProcessResult",
-    "SeasonYearRequired",
-]
+from .config import Config, LoadWiseInputError, SeasonYearRequired, Thresholds  # noqa: E402
+from .pipeline import ProcessResult, preview_workbook, process_workbook  # noqa: E402
+
+__all__ = ["Config", "Thresholds", "LoadWiseInputError", "SeasonYearRequired",
+           "process_workbook", "preview_workbook", "ProcessResult", "__version__"]

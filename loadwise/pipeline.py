@@ -1,174 +1,252 @@
-"""End-to-end orchestration: ingest -> normalize -> validate -> dedupe ->
-aggregate -> export. This is the single reusable entry point for both the
-Streamlit UI and other applications.
+"""End-to-end orchestration: ingest -> normalize -> validate -> aggregate -> export.
+
+`process_workbook` is a pure function of (file bytes, config, overrides): the same
+inputs always give byte-identical JSON (pass `generated_at` to pin the timestamp).
+Reading the workbook is the slow part, so a `ProcessResult` keeps its ingests and
+`result.reprocess(overrides)` re-runs only the fast steps.
 """
 
 from __future__ import annotations
 
-import io
+import datetime as dt
+from collections import Counter
 from dataclasses import dataclass, field
-from typing import List, Optional, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
-from . import aggregate, duplicates, export, ingest, normalize, validate
-from .config import SCHEMA_VERSION, Config
-from .dates import rollover_preview, check_day_index_consistency
-from .identity import IdentityMap
-from .validate import FlagCollector
+from . import __version__
+from .aggregate import build_athletes, build_daily_records, build_schedule_context
+from .config import SCHEMA_VERSION, Config, LoadWiseInputError, SeasonYearRequired
+from .export import FIELD_DICTIONARY, daily_to_csv, sanitize, to_json
+from .ingest import (FULL_DAY_COLUMNS, WorkbookIngest, ingest_workbook)
+from .normalize import _jsonable, is_yearless, normalize_sheet, resolve_date, rollover_preview
+from .validate import (FlagCollector, apply_overrides, check_dates, check_gd_conflicts,
+                       flag_possible_duplicates, mark_exact_duplicates, validate_sessions,
+                       validate_wellness)
+
+SourceLike = Union[str, bytes, Tuple[str, bytes]]
 
 
-class SeasonYearRequired(Exception):
-    """Raised when processing is attempted without a configured season start year.
+def _as_list(sources) -> List[SourceLike]:
+    if isinstance(sources, (str, bytes, tuple)):
+        return [sources]
+    return list(sources)
 
-    Carries an actionable, user-facing message. We never invent a year.
-    """
 
-    def __init__(self, sample_months=None):
-        self.sample_months = sample_months or []
-        msg = ("A season start year is required to resolve the workbook's day/month "
-               "dates (which run September into January). Set Config.season_start_year "
-               "to the calendar year the September records belong to. LoadWise will not "
-               "default to the current year or guess.")
-        super().__init__(msg)
+def ingest_all(sources: Union[SourceLike, Iterable[SourceLike]]) -> List[WorkbookIngest]:
+    """Read every workbook once; identical files (same SHA-256) are read only once."""
+    out, seen = [], set()
+    for src in _as_list(sources):
+        name, data = (src if isinstance(src, tuple) else (None, src))
+        ing = ingest_workbook(data, filename=name)
+        if ing.sha256 not in seen:
+            seen.add(ing.sha256)
+            out.append(ing)
+    return out
+
+
+def _yearless_samples(ingests: List[WorkbookIngest]) -> List[str]:
+    samples = []
+    for ing in ingests:
+        for sheet in (ing.full_day, ing.wellness):
+            h = sheet.mapping.get("date")
+            for r in sheet.records:
+                v = r.cells.get(h) if h else None
+                if is_yearless(v):
+                    samples.append(v.strip())
+                    if len(samples) >= 3:
+                        return samples
+    return samples
 
 
 @dataclass
 class ProcessResult:
-    """Everything a caller needs, in memory, plus the JSON-safe output object."""
-    config: Config
-    idmap: IdentityMap
-    cleaned_records: List[dict]
-    wellness_records: List[dict]
-    daily_records: List[dict]
-    athlete_history: List[dict]
-    quality_flags: List[dict]
-    rollover_preview: list
-    day_index_issues: list
     output: dict
-    raw_full_day: list = field(default_factory=list)
-    raw_wellness: list = field(default_factory=list)
+    ingests: List[WorkbookIngest] = field(repr=False)
+    config: Config = field(repr=False)
+    overrides: Dict[str, dict] = field(default_factory=dict, repr=False)
+    generated_at: Optional[str] = None
+
+    @property
+    def daily_records(self) -> List[dict]:
+        return self.output["dailyRecords"]
+
+    @property
+    def cleaned_records(self) -> List[dict]:
+        return self.output["cleanedRecords"]
+
+    @property
+    def quality_flags(self) -> List[dict]:
+        return self.output["qualityFlags"]
 
     def to_json(self, indent: Optional[int] = 2, include_raw: bool = True) -> str:
-        return export.to_json(self.output, indent=indent, include_raw=include_raw)
+        return to_json(self.output, indent=indent, include_raw=include_raw)
 
     def to_daily_csv(self) -> str:
-        return export.daily_to_csv(self.daily_records)
+        return daily_to_csv(self.daily_records)
+
+    def reprocess(self, overrides: Optional[Dict[str, dict]] = None) -> "ProcessResult":
+        return build(self.ingests, self.config, overrides if overrides is not None else self.overrides,
+                     generated_at=self.generated_at)
 
 
-def _recompute_daily(result: ProcessResult) -> None:
-    """Rebuild daily records + history + output after status overrides change."""
-    result.daily_records = aggregate.build_daily_records(result.cleaned_records,
-                                                         result.wellness_records)
-    result.athlete_history = aggregate.build_athlete_history(result.daily_records)
-    result.output = export.build_output(
-        config=result.config, idmap=result.idmap,
-        raw_full_day=result.raw_full_day, raw_wellness=result.raw_wellness,
-        cleaned_records=result.cleaned_records, daily_records=result.daily_records,
-        wellness_records=result.wellness_records, athlete_history=result.athlete_history,
-        quality_flags=result.quality_flags, import_metadata=result.output["importMetadata"],
-        rollover_preview=result.rollover_preview, day_index_issues=result.day_index_issues,
-    )
-
-
-def apply_override(result: ProcessResult, record_id: str, action: str,
-                   reason: str = "") -> ProcessResult:
-    """Apply a manual include/exclude override to one record and recompute.
-
-    action: 'include' or 'exclude'. The decision + reason are recorded on the
-    record and the affected daily outputs are recalculated.
-    """
-    if action not in ("include", "exclude"):
-        raise ValueError("action must be 'include' or 'exclude'")
-    for rec in result.cleaned_records:
-        if rec["record_id"] == record_id:
-            if rec["status"] == "rejected":
-                raise ValueError("Cannot override a rejected record (no usable athlete/date).")
-            rec["override"] = {"action": action, "reason": reason}
-            rec["status"] = "included" if action == "include" else "excluded"
-            rec["status_reason"] = f"manual_override:{action}" + (f" ({reason})" if reason else "")
-            break
-    else:
-        raise KeyError(f"record_id not found: {record_id}")
-    _recompute_daily(result)
-    return result
-
-
-def process_workbook(source: Union[str, bytes, io.BytesIO],
-                     config: Config,
-                     *,
-                     file_label: Optional[str] = None,
-                     existing_identity: Optional[dict] = None,
+def process_workbook(sources, config: Config, overrides: Optional[Dict[str, dict]] = None,
                      generated_at: Optional[str] = None) -> ProcessResult:
-    """Run the full pipeline and return a ProcessResult.
+    """Process one workbook (path, bytes or (filename, bytes)) or a list of them.
 
-    ``generated_at`` is injected (not read from the clock) so output is
-    deterministic/idempotent in tests; the UI passes a real timestamp.
-    Raises SeasonYearRequired if config.season_start_year is None.
+    Raises SeasonYearRequired if yearless dates exist and config.season_start_year is None,
+    and LoadWiseInputError for unusable files (empty, not .xlsx, missing required sheet/columns).
     """
+    return build(ingest_all(sources), config, overrides or {}, generated_at=generated_at)
+
+
+def build(ingests: List[WorkbookIngest], config: Config, overrides: Dict[str, dict],
+          generated_at: Optional[str] = None) -> ProcessResult:
+    if not ingests:
+        raise LoadWiseInputError("No workbook to process.")
     if config.season_start_year is None:
-        raise SeasonYearRequired()
+        samples = _yearless_samples(ingests)
+        if samples:
+            raise SeasonYearRequired(samples)
+    for rid, ov in (overrides or {}).items():
+        if ov.get("action") not in ("include", "exclude"):
+            raise LoadWiseInputError(f"Override for {rid} must be 'include' or 'exclude'.")
 
-    # 1. Ingest (raw, immutable, with provenance).
-    sheets = ingest.ingest_workbook(source, file_label=file_label)
-    full_day_si = sheets["full_day"]
-    wellness_si = sheets["wellness"]
-
-    # 2. Identity map (shared across both sheets, stable across uploads).
-    idmap = IdentityMap(existing_identity)
-    idmap.register_all(normalize.collect_labels(full_day_si, wellness_si))
-
-    # 3. Normalize.
-    cleaned = [normalize.normalize_full_day(r, config, idmap) for r in full_day_si.records]
-    wellness = ([normalize.normalize_wellness(r, config, idmap) for r in wellness_si.records]
-                if wellness_si.present else [])
-
-    # 4. Validate.
     fc = FlagCollector()
-    validate.validate_full_day(cleaned, config, fc)
-    if wellness:
-        validate.validate_wellness(wellness, config, fc)
+    sessions, wellness, raw_cells, raw_out = [], [], {}, []
+    for ing in ingests:
+        epoch = ing.workbook_epoch
+        s = normalize_sheet(ing.full_day, "session", config, epoch)
+        for rec in s:
+            rec["study_day_consistent"] = True
+        validate_sessions(s, config, fc)
+        check_dates(s, fc)
+        sessions += s
+        wellness += normalize_sheet(ing.wellness, "wellness", config, epoch)
+        for sheet in (ing.full_day, ing.wellness):
+            for r in sheet.records:
+                raw_cells[r.record_id] = r.cells
+                raw_out.append({
+                    "record_id": r.record_id, "import_id": r.import_id, "file": r.file,
+                    "sheet": r.sheet, "excel_row": r.excel_row,
+                    "cells": {k: _jsonable(v) for k, v in r.cells.items()},
+                    "number_formats": {k: f for k, f in r.formats.items() if f != "General"},
+                })
+        unavailable = [FULL_DAY_COLUMNS[k] for k, h in ing.full_day.mapping.items() if h is None]
+        if unavailable:
+            fc.add(f"COLUMN_UNAVAILABLE", "info",
+                   f"{ing.file}: optional columns not present: {', '.join(unavailable)}.",
+                   "Those fields are null (unavailable) for every session of this file.")
+        if not ing.wellness.present:
+            fc.add("OPTIONAL_SHEET_MISSING", "info",
+                   f"{ing.file}: " + " ".join(ing.wellness.messages),
+                   "Daily records from this file have no wellness observations.")
 
-    # 5. Duplicate handling.
-    raw_by_id = {r.record_id: r for r in full_day_si.records}
-    duplicates.mark_exact_duplicates(cleaned, raw_by_id, fc)
-    duplicates.flag_possible_duplicates(cleaned, fc, config.overlap_warn_fraction)
+    mark_exact_duplicates(sessions, raw_cells, fc)
+    flag_possible_duplicates(sessions, config, fc)
+    apply_overrides(sessions, overrides or {}, fc)
+    check_gd_conflicts(sessions, fc)
+    validate_wellness(wellness, {s["athlete_id"] for s in sessions if s["athlete_id"]}, fc)
 
-    # 6. Aggregate.
-    daily = aggregate.build_daily_records(cleaned, wellness)
-    history = aggregate.build_athlete_history(daily)
+    daily = build_daily_records(sessions, wellness)
+    athletes = build_athletes(sessions, wellness, daily)
+    for a in athletes:
+        if len({v.strip().casefold() for v in a["source_label_variants"]}) < len(a["source_label_variants"]):
+            fc.add("ATHLETE_LABEL_VARIANT", "info",
+                   f"Labels {a['source_label_variants']} differ only in spacing/case and were treated "
+                   f"as one athlete ({a['athlete_id']}).", "Sessions combined under one athlete ID.")
+    flags = fc.flags
+    sev_by_id = {f["flag_id"]: f["severity"] for f in flags}
+    for d in daily:
+        c = Counter(sev_by_id[f] for f in d["quality"]["flag_ids"] if f in sev_by_id)
+        d["quality"]["flag_counts"] = {s: c.get(s, 0) for s in ("error", "warning", "info")}
 
-    # Date/day-index issues for the configuration block.
-    import datetime as _dt
-    resolved_rows = [
-        {"record_id": r["record_id"], "excel_row": r["provenance"]["excel_row"],
-         "date": _dt.date.fromisoformat(r["date_resolved"]), "day_index": r["day_index"]}
-        for r in cleaned if r["date_resolved"] and r["day_index"] is not None
-    ]
-    day_index_issues = check_day_index_consistency(resolved_rows)
-
-    import_metadata = {
+    status = Counter(s["status"] for s in sessions)
+    sev = Counter(f["severity"] for f in flags)
+    output = {
         "schemaVersion": SCHEMA_VERSION,
-        "source_file": file_label or (source if isinstance(source, str) else "<uploaded>"),
-        "generated_at": generated_at,  # None => deterministic; UI injects real time
-        "full_day_sheet": {"name": full_day_si.name, "header_row": full_day_si.header_row,
-                            "detected_records": len(full_day_si.records)},
-        "wellness_sheet": {"name": wellness_si.name, "present": wellness_si.present,
-                           "header_row": wellness_si.header_row,
-                           "detected_records": len(wellness_si.records), "note": wellness_si.note},
-        "identity_map": idmap.as_dict(),
+        "importMetadata": {
+            "generator": f"loadwise {__version__}",
+            "generated_at": generated_at,
+            "imports": [{
+                "import_id": ing.import_id, "sha256": ing.sha256, "file": ing.file,
+                "sheets_present": ing.sheet_names, "workbook_date_epoch": ing.epoch,
+                "full_day": {"sheet": ing.full_day.name, "header_row": ing.full_day.header_row,
+                             "records": len(ing.full_day.records),
+                             "column_mapping": ing.full_day.mapping,
+                             "messages": ing.full_day.messages},
+                "wellness": {"sheet": ing.wellness.name, "present": ing.wellness.present,
+                             "header_row": ing.wellness.header_row,
+                             "records": len(ing.wellness.records),
+                             "column_mapping": ing.wellness.mapping,
+                             "messages": ing.wellness.messages},
+            } for ing in ingests],
+        },
+        "configuration": {**config.to_dict(), "overrides": {k: overrides[k] for k in sorted(overrides)}},
+        "fieldDictionary": FIELD_DICTIONARY,
+        "athletes": athletes,
+        "rawRecords": raw_out,
+        "cleanedRecords": sessions,
+        "dailyRecords": daily,
+        "wellnessRecords": wellness,
+        "scheduleContext": build_schedule_context(sessions),
+        "qualityFlags": flags,
+        "summary": {
+            "imports": len(ingests),
+            "session_records": len(sessions),
+            "sessions_included": status.get("included", 0),
+            "sessions_excluded": status.get("excluded", 0),
+            "sessions_rejected": status.get("rejected", 0),
+            "excluded_exact_duplicates": sum(s["status_reason"] == "exact_duplicate" for s in sessions),
+            "possible_duplicate_sessions": sum(bool(s.get("possible_duplicate_of")) for s in sessions),
+            "wellness_records": len(wellness),
+            "athletes": len(athletes),
+            "resolved_dates": len({s["date"] for s in sessions if s["date"]}),
+            "daily_records": len(daily),
+            "daily_records_with_incomplete_metrics": sum(bool(d["quality"]["incomplete_metrics"])
+                                                         for d in daily),
+            "multi_session_days": sum(d["session_count"] > 1 for d in daily),
+            "flags": {s: sev.get(s, 0) for s in ("error", "warning", "info")},
+            "flags_by_rule": dict(sorted(Counter(f["rule_code"] for f in flags).items())),
+            "date_range": {"first": min((d["date"] for d in daily), default=None),
+                           "last": max((d["date"] for d in daily), default=None)},
+        },
     }
+    return ProcessResult(output=sanitize(output), ingests=ingests, config=config,
+                         overrides=dict(overrides or {}), generated_at=generated_at)
 
-    output = export.build_output(
-        config=config, idmap=idmap,
-        raw_full_day=full_day_si.records, raw_wellness=wellness_si.records,
-        cleaned_records=cleaned, daily_records=daily, wellness_records=wellness,
-        athlete_history=history, quality_flags=fc.flags,
-        import_metadata=import_metadata,
-        rollover_preview=rollover_preview(config), day_index_issues=day_index_issues,
-    )
 
-    return ProcessResult(
-        config=config, idmap=idmap, cleaned_records=cleaned, wellness_records=wellness,
-        daily_records=daily, athlete_history=history, quality_flags=fc.flags,
-        rollover_preview=rollover_preview(config), day_index_issues=day_index_issues,
-        output=output, raw_full_day=full_day_si.records, raw_wellness=wellness_si.records,
-    )
+def preview_workbook(source: SourceLike, config: Config) -> dict:
+    """Cheap pre-processing review: sheets, detected headers, date samples, rollover table.
+
+    Never raises for a missing season year; reports `needs_season_year` instead.
+    """
+    return preview_ingest(ingest_all(source)[0], config)
+
+
+def preview_ingest(ing: WorkbookIngest, config: Config) -> dict:
+    """Same as preview_workbook, for an already-read workbook."""
+    h = ing.full_day.mapping.get("date")
+    raw_dates = [r.cells.get(h) for r in ing.full_day.records] if h else []
+    sample_idx = sorted(set(list(range(min(3, len(raw_dates)))) +
+                            list(range(max(0, len(raw_dates) - 3), len(raw_dates)))))
+    needs_year = any(is_yearless(v) for v in raw_dates) and config.season_start_year is None
+    return sanitize({
+        "file": ing.file, "sha256": ing.sha256, "sheets_present": ing.sheet_names,
+        "workbook_date_epoch": ing.epoch,
+        "sheets": [{
+            "role": role, "sheet": s.name, "present": s.present, "header_row": s.header_row,
+            "records": len(s.records), "columns": len(s.headers),
+            "mapped": {k: v for k, v in s.mapping.items() if v},
+            "unavailable": [k for k, v in s.mapping.items() if v is None],
+            "messages": s.messages,
+        } for role, s in (("workload sessions", ing.full_day), ("wellness", ing.wellness))],
+        "needs_season_year": needs_year,
+        "date_samples": [{"excel_row": ing.full_day.records[i].excel_row, "raw": _jsonable(raw_dates[i]),
+                          "resolved": resolve_date(raw_dates[i], config, ing.workbook_epoch)}
+                         for i in sample_idx],
+        "rollover": rollover_preview(raw_dates, config),
+    })
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
