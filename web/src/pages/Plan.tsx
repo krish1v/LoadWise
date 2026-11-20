@@ -1,19 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import ReactECharts from "echarts-for-react";
-import { Download, Dumbbell, Moon, RotateCcw, Trophy, Zap } from "lucide-react";
+import { Download, RotateCcw, Zap } from "lucide-react";
 import {
   api, PLANNING_FIELDS,
-  type Activity, type PlanConfig, type PlanHistory, type PlanResult, type Planning, type PlanningKey,
+  type Activity, type FeedbackRecord, type PlanConfig, type PlanHistory, type PlanResult, type Planning, type PlanningKey,
 } from "../api";
+import { ACTIVITY } from "../activity";
 import { fmt, fmtDate, shortDate } from "../format";
+import { FeedbackLog, PlanFeedback } from "../components/PlanFeedback";
 import { Button, DateInput, ErrorNote, Legend, Loading, PageHeader, Panel, Segmented, Select, useChartTheme } from "../components/ui";
-
-const ACTIVITY: Record<Activity, { label: string; icon: typeof Dumbbell; next: Activity }> = {
-  training: { label: "Training", icon: Dumbbell, next: "game" },
-  game: { label: "Game", icon: Trophy, next: "rest" },
-  rest: { label: "Rest", icon: Moon, next: "training" },
-};
 
 const MINUTES: [PlanningKey, string][] = [
   ["original_team", "Planned team practice"],
@@ -48,8 +44,20 @@ function parseDraft(d: Draft): Planning | string {
   return out;
 }
 
+// ?feedback=<id> reopens a saved coach decision, so it survives a page refresh.
+const urlFeedbackId = () => Number(new URLSearchParams(window.location.search).get("feedback")) || null;
+function setUrlFeedback(id: number | null) {
+  const url = new URL(window.location.href);
+  url.search = id ? `?feedback=${id}` : "";
+  window.history.replaceState(null, "", url);
+}
+
 export function PlanPage() {
+  const qc = useQueryClient();
   const meta = useQuery({ queryKey: ["plan-meta"], queryFn: api.planMeta, retry: false });
+  const [feedbackId, setFeedbackId] = useState<number | null>(urlFeedbackId);
+  const savedQ = useQuery({ queryKey: ["plan-feedback", feedbackId], queryFn: () => api.planFeedbackGet(feedbackId!), enabled: feedbackId != null, retry: false });
+  const [pendingRestore, setPendingRestore] = useState<PlanConfig | null>(null);
   const [athlete, setAthlete] = useState("");
   const [start, setStart] = useState("");
   const [schedule, setSchedule] = useState<Activity[]>([]);
@@ -63,7 +71,13 @@ export function PlanPage() {
   useEffect(() => {
     const m = meta.data;
     if (!m || athlete) return;
+    if (feedbackId != null && savedQ.isLoading) return;
     setSchedule(m.schedule);
+    if (savedQ.data) {
+      const c = savedQ.data.config;
+      setPendingRestore(c); setAthlete(c.athlete); setStart(c.start);
+      return;
+    }
     // /plan?demo=1 opens straight into the modelling team's reference example.
     if (m.demo && new URLSearchParams(window.location.search).get("demo") === "1") {
       setPendingDemo(m.demo); setAthlete(m.demo.athlete); setStart(m.demo.start);
@@ -71,7 +85,7 @@ export function PlanPage() {
     }
     setAthlete(m.roster[0]?.athlete_id ?? "");
     setStart(m.last_start ?? "");
-  }, [meta.data, athlete]);
+  }, [meta.data, athlete, savedQ.data, savedQ.isLoading]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   const hist = useQuery({
     queryKey: ["plan-history", athlete, start],
@@ -86,6 +100,11 @@ export function PlanPage() {
     const h = hist.data;
     if (!h) return;
     run.reset();
+    if (pendingRestore && pendingRestore.athlete === h.athlete_id && pendingRestore.start === h.start) {
+      applyConfig(pendingRestore);
+      setPendingRestore(null);
+      return;
+    }
     if (pendingDemo && pendingDemo.athlete === h.athlete_id && pendingDemo.start === h.start) {
       setDraft(toDraft(pendingDemo.planning));
       setSchedule(pendingDemo.schedule);
@@ -101,6 +120,25 @@ export function PlanPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hist.data]);
 
+  function applyConfig(c: PlanConfig) {
+    setDraft(toDraft(c.planning)); setSchedule(c.schedule); setObjective(c.objective); setStep(c.step); setPooled(c.allow_pooled);
+  }
+  const showFeedback = (id: number | null) => { setFeedbackId(id); setUrlFeedback(id); };
+  const openFeedback = (rec: FeedbackRecord) => {
+    qc.setQueryData(["plan-feedback", rec.id], rec);
+    showFeedback(rec.id);
+    run.reset();
+    const c = rec.config;
+    if (c.athlete === athlete && c.start === start) applyConfig(c);
+    else { setPendingDemo(null); setPendingRestore(c); setAthlete(c.athlete); setStart(c.start); }
+    document.getElementById("plan-result")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+  const onSaved = (rec: FeedbackRecord) => {
+    qc.setQueryData(["plan-feedback", rec.id], rec);
+    qc.invalidateQueries({ queryKey: ["plan-feedback-list"] });
+    showFeedback(rec.id);
+  };
+
   if (meta.isLoading) return <Loading what="Loading the planning models" />;
   if (meta.error) return <ErrorNote error={meta.error} />;
   const m = meta.data!;
@@ -112,10 +150,12 @@ export function PlanPage() {
     const planning = parseDraft(draft);
     if (typeof planning === "string") { setInputError(planning); return; }
     setInputError(null);
+    showFeedback(null);
     run.mutate({ athlete, start, planning, schedule, step, objective, allow_pooled: pooled, overrides: {} });
   };
   const loadDemo = () => {
     if (!m.demo) return;
+    showFeedback(null);
     if (athlete === m.demo.athlete && start === m.demo.start) {
       setDraft(toDraft(m.demo.planning)); setSchedule(m.demo.schedule); setObjective(m.demo.objective); setStep(m.demo.step);
       run.mutate(m.demo);
@@ -123,7 +163,7 @@ export function PlanPage() {
       setPendingDemo(m.demo); setAthlete(m.demo.athlete); setStart(m.demo.start);
     }
   };
-  const resetInputs = () => { if (h) { setDraft(toDraft(h.planning)); setSchedule(m.schedule); setObjective("terminal"); setStep(5); run.reset(); } };
+  const resetInputs = () => { if (h) { setDraft(toDraft(h.planning)); setSchedule(m.schedule); setObjective("terminal"); setStep(5); run.reset(); showFeedback(null); } };
 
   return (
     <>
@@ -134,11 +174,11 @@ export function PlanPage() {
       />
 
       <div className="mb-5 flex flex-wrap items-end gap-x-5 gap-y-3 rounded-lg border border-line bg-surface px-4 py-3">
-        <Select label="Athlete" value={athlete} onChange={(v) => { setAthlete(v); setPendingDemo(null); }} className="min-w-44">
+        <Select label="Athlete" value={athlete} onChange={(v) => { setAthlete(v); setPendingDemo(null); setPendingRestore(null); showFeedback(null); }} className="min-w-44">
           {m.roster.map((a) => <option key={a.athlete_id} value={a.athlete_id}>{a.label}</option>)}
         </Select>
         <DateInput label="First day of the plan" value={start} min={m.first_start ?? undefined} max={m.last_start ?? undefined}
-          onChange={(v) => { if (v) { setStart(v); setPendingDemo(null); } }} />
+          onChange={(v) => { if (v) { setStart(v); setPendingDemo(null); setPendingRestore(null); showFeedback(null); } }} />
         {h && <ModelMode h={h} fitting={m.fitting_period.last_date} />}
       </div>
 
@@ -205,10 +245,21 @@ export function PlanPage() {
             </Button>
           </form>
 
-          <div className="min-w-0 space-y-5">
-            {run.error ? <ErrorNote error={run.error} /> : run.data ? <PlanResultView r={run.data} label={h.label} />
+          <div id="plan-result" className="min-w-0 scroll-mt-4 space-y-5">
+            {feedbackId != null ? (
+              savedQ.error ? <ErrorNote error={savedQ.error} />
+                : !savedQ.data ? <Panel><Loading what="Opening the saved decision" /></Panel>
+                : <>
+                    <PlanResultView r={savedQ.data.proposal} label={savedQ.data.athlete_label} />
+                    <PlanFeedback config={savedQ.data.config} proposal={savedQ.data.proposal} saved={savedQ.data} onSaved={onSaved} />
+                  </>
+            ) : run.error ? <ErrorNote error={run.error} /> : run.data && run.variables ? <>
+                <PlanResultView r={run.data} label={h.label} />
+                <PlanFeedback config={run.variables} proposal={run.data} saved={null} onSaved={onSaved} />
+              </>
               : run.isPending ? <Panel><Loading what="Predicting every candidate duration and solving the week" /></Panel>
               : <Panel><p className="py-6 text-center text-ink-2">Set the week and limits, then create the plan. Predictions appear here with the planned minutes for each day.</p></Panel>}
+            <FeedbackLog athleteId={athlete} label={h.label} activeId={feedbackId} onOpen={openFeedback} />
             <HistoryPanel h={h} />
           </div>
         </div>

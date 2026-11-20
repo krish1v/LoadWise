@@ -129,3 +129,53 @@ def test_demo_and_training_planner(client):
     bad = client.post("/api/plan/optimize", json={**demo, "schedule": ["rest"] * 7})
     assert bad.status_code == 400 and "training day" in bad.json()["detail"]
     assert client.get("/api/plan/models").json()["comparison"]
+
+
+@pytest.mark.skipif(not os.path.exists(REAL_WORKBOOK), reason="real workbook not present")
+def test_coach_feedback_flow(tmp_path):
+    from api.main import create_app
+    db = str(tmp_path / "fb.db")
+    client = TestClient(create_app(db, autoload_demo=False))
+    client.post("/api/imports/demo")
+    demo = client.get("/api/plan/meta").json()["demo"]
+    plan = client.post("/api/plan/optimize", json=demo).json()
+    days = [{"day": d["day"], "kind": d["kind"], "team": d["team"], "extra": d["extra"]} for d in plan["plan"]]
+
+    # Re-predicting the optimiser's own days reproduces its predictions.
+    ev = client.post("/api/plan/evaluate", json={"config": demo, "days": days}).json()
+    assert ev["day7_mip"] == pytest.approx(plan["day7_mip"], abs=1e-9)
+    assert ev["weekly_ml"] == pytest.approx(plan["weekly_ml"], abs=1e-6)
+    assert ev["warnings"] == []
+
+    base = {"config": demo, "proposal": plan}
+    acc = client.post("/api/plan/feedback", json={**base, "decision": "accepted", "rating": 4, "comment": " good "}).json()
+    assert acc["decision"] == "accepted" and acc["rating"] == 4 and acc["rating_scale"] == "acceptance"
+    assert acc["comment"] == "good" and acc["proposal"] == plan and acc["modified"] is None and acc["created_at"]
+    rej = client.post("/api/plan/feedback", json={**base, "decision": "rejected", "rating": 2}).json()
+    assert rej["rating_scale"] == "rejection" and rej["comment"] is None
+
+    edited = [dict(d) for d in days]
+    edited[1].update(kind="rest", team=0, extra=0)
+    edited[4]["team"] = max(0, edited[4]["team"] - 20)
+    mod = client.post("/api/plan/feedback", json={**base, "decision": "modified", "comment": "lighter",
+                                                   "modified": {"days": edited}}).json()
+    assert mod["decision"] == "modified" and mod["rating"] is None and mod["rating_scale"] is None
+    ev_mod = mod["modified"]["evaluation"]
+    assert ev_mod["plan"][1]["kind"] == "rest" and ev_mod["plan"][1]["mip1"] is None
+    assert mod["proposal"] == plan                                 # original kept untouched
+
+    # Validation
+    assert client.post("/api/plan/feedback", json={**base, "decision": "accepted"}).status_code == 422
+    assert client.post("/api/plan/feedback", json={**base, "decision": "rejected", "rating": 6}).status_code == 422
+    assert client.post("/api/plan/feedback", json={**base, "decision": "modified", "rating": 3,
+                                                   "modified": {"days": edited}}).status_code == 422
+    assert client.post("/api/plan/feedback", json={**base, "decision": "maybe", "rating": 3}).status_code == 422
+    assert client.post("/api/plan/evaluate", json={"config": demo, "days": days[:6]}).status_code == 400
+
+    # Persists across app restarts and survives a data reset.
+    client.delete("/api/store")
+    again = TestClient(create_app(db, autoload_demo=False))
+    listed = again.get("/api/plan/feedback").json()
+    assert [r["decision"] for r in listed] == ["modified", "rejected", "accepted"]
+    assert again.get(f"/api/plan/feedback/{acc['id']}").json()["rating"] == 4
+    assert again.get("/api/plan/feedback/9999").status_code == 404

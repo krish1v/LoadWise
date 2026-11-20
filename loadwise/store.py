@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import json
 import os
 import sqlite3
 from typing import Dict, List, Optional, Tuple
@@ -32,7 +33,27 @@ CREATE TABLE IF NOT EXISTS overrides (
     reason TEXT NOT NULL,
     decided_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS plan_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    athlete_id TEXT NOT NULL,
+    athlete_label TEXT NOT NULL,
+    start TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('accepted', 'rejected', 'modified')),
+    rating INTEGER CHECK (rating BETWEEN 1 AND 5),
+    rating_scale TEXT CHECK (rating_scale IN ('acceptance', 'rejection')),
+    comment TEXT,
+    config_json TEXT NOT NULL,
+    proposal_json TEXT NOT NULL,
+    modified_json TEXT
+);
 """
+
+DECISIONS = ("accepted", "rejected", "modified")
+RATING_SCALE = {"accepted": "acceptance", "rejected": "rejection"}
+FEEDBACK_COLUMNS = ("id", "created_at", "athlete_id", "athlete_label", "start", "decision", "rating",
+                    "rating_scale", "comment", "config_json", "proposal_json", "modified_json")
+COMMENT_LIMIT = 2000
 
 
 class Store:
@@ -106,6 +127,61 @@ class Store:
     def clear_override(self, record_id: str) -> None:
         with self._conn() as c:
             c.execute("DELETE FROM overrides WHERE record_id = ?", (record_id,))
+
+    # -- coach feedback on proposed plans ------------------------------------
+    # Kept on reset: it is evaluation data about the models, not part of the imported dataset.
+    def add_feedback(self, *, athlete_id: str, athlete_label: str, start: str, decision: str,
+                     rating: Optional[int], comment: Optional[str], config: dict, proposal: dict,
+                     modified: Optional[dict] = None) -> dict:
+        """Append one coach decision. Ratings are stored with their own scale, never pooled."""
+        if decision not in DECISIONS:
+            raise LoadWiseInputError("Decision must be accepted, rejected or modified.")
+        if decision == "modified":
+            if rating is not None:
+                raise LoadWiseInputError("A modified plan is not rated.")
+            if not modified:
+                raise LoadWiseInputError("A modified plan needs the edited days.")
+        else:
+            if type(rating) is not int or not 1 <= rating <= 5:
+                raise LoadWiseInputError("Choose a rating from 1 to 5.")
+            if modified is not None:
+                raise LoadWiseInputError("Only a modified plan carries edited days.")
+        comment = (comment or "").strip() or None
+        if comment and len(comment) > COMMENT_LIMIT:
+            raise LoadWiseInputError(f"Keep the comment under {COMMENT_LIMIT} characters.")
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO plan_feedback (created_at, athlete_id, athlete_label, start, decision, rating, "
+                "rating_scale, comment, config_json, proposal_json, modified_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(), athlete_id,
+                 athlete_label, start, decision, rating, RATING_SCALE.get(decision), comment,
+                 json.dumps(config), json.dumps(proposal),
+                 json.dumps(modified) if modified is not None else None))
+            new_id = cur.lastrowid
+        return self.feedback_record(new_id)
+
+    @staticmethod
+    def _feedback_row(row) -> dict:
+        d = dict(zip(FEEDBACK_COLUMNS, row))
+        for k in ("config", "proposal", "modified"):
+            raw = d.pop(k + "_json")
+            d[k] = json.loads(raw) if raw is not None else None
+        return d
+
+    def feedback(self, athlete_id: Optional[str] = None) -> List[dict]:
+        sql = f"SELECT {', '.join(FEEDBACK_COLUMNS)} FROM plan_feedback"
+        args: tuple = ()
+        if athlete_id:
+            sql, args = sql + " WHERE athlete_id = ?", (athlete_id,)
+        with self._conn() as c:
+            rows = c.execute(sql + " ORDER BY id DESC", args).fetchall()
+        return [self._feedback_row(r) for r in rows]
+
+    def feedback_record(self, feedback_id: int) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute(f"SELECT {', '.join(FEEDBACK_COLUMNS)} FROM plan_feedback WHERE id = ?",
+                            (feedback_id,)).fetchone()
+        return self._feedback_row(row) if row else None
 
     def reset(self) -> None:
         with self._conn() as c:

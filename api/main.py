@@ -35,6 +35,20 @@ class OverrideIn(BaseModel):
     reason: str
 
 
+class EvaluateIn(BaseModel):
+    config: dict
+    days: List[dict]
+
+
+class FeedbackIn(BaseModel):
+    config: dict
+    proposal: dict
+    decision: str
+    rating: Optional[int] = None
+    comment: Optional[str] = None
+    modified: Optional[dict] = None     # {"days": [{day, kind, team, extra}, ...]}
+
+
 class State:
     """Holds the store plus a cached ProcessResult, rebuilt only when inputs change."""
 
@@ -466,6 +480,59 @@ def create_app(db_path: Optional[str] = None, autoload_demo: Optional[bool] = No
             plan_lock.release()
         result.pop("csv", None)
         return jsonable(result)
+
+    # -- coach feedback on a proposed plan (stored for later evaluation; models unchanged) --
+    def evaluate_days(config: dict, days: list) -> dict:
+        from planner import jsonable
+        from planner.evaluate import evaluate_plan
+        res, ctx = planning()
+        if not isinstance(config.get("athlete"), str):
+            raise HTTPException(400, "Select an athlete.")
+        config = {**config, "athlete": plan_label(res, config["athlete"])}
+        try:
+            return jsonable(evaluate_plan(ctx, config, days))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.post("/api/plan/evaluate")
+    def plan_evaluate(body: EvaluateIn):
+        return evaluate_days(body.config, body.days)
+
+    @app.post("/api/plan/feedback")
+    def plan_feedback_create(body: FeedbackIn):
+        res = need()
+        athlete = body.config.get("athlete")
+        if not isinstance(athlete, str):
+            raise HTTPException(400, "Select an athlete.")
+        label = plan_label(res, athlete)
+        start = body.proposal.get("start") or body.config.get("start")
+        modified = None
+        if body.decision == "modified":
+            days = (body.modified or {}).get("days")
+            if not days:
+                raise HTTPException(400, "A modified plan needs the edited days.")
+            # Store predictions computed here, not whatever the browser sent.
+            modified = {"days": days, "evaluation": evaluate_days(body.config, days)}
+        elif body.modified is not None:
+            raise HTTPException(400, "Only a modified plan carries edited days.")
+        try:
+            return state.store.add_feedback(
+                athlete_id=athlete, athlete_label=label, start=str(start), decision=body.decision,
+                rating=body.rating, comment=body.comment, config=body.config,
+                proposal=body.proposal, modified=modified)
+        except LoadWiseInputError as e:
+            return _err(e)
+
+    @app.get("/api/plan/feedback")
+    def plan_feedback_list(athlete: Optional[str] = None):
+        return state.store.feedback(athlete)
+
+    @app.get("/api/plan/feedback/{feedback_id}")
+    def plan_feedback_get(feedback_id: int):
+        rec = state.store.feedback_record(feedback_id)
+        if rec is None:
+            raise HTTPException(404, "No saved feedback with that id.")
+        return rec
 
     @app.get("/api/plan/models")
     def plan_models():

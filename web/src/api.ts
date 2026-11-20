@@ -267,6 +267,45 @@ export interface PlanResult extends PlanSummary {
   limitation: string;
 }
 
+export type Decision = "accepted" | "rejected" | "modified";
+
+/** One day as the coach set it in the Modify editor. */
+export interface EditedDay { day: number; kind: Activity; team: number; extra: number }
+
+export interface EvaluatedDay extends PlanDay { supported: boolean | null }
+
+export interface EvaluatedPlan extends PlanSummary {
+  start: string;
+  plan: EvaluatedDay[];
+  pooled: boolean;
+  warnings: { day: number | null; code: string; message: string }[];
+}
+
+export interface FeedbackRecord {
+  id: number;
+  created_at: string;
+  athlete_id: string;
+  athlete_label: string;
+  start: string;
+  decision: Decision;
+  rating: number | null;
+  /** Accept and reject ratings point in opposite directions; never compare them directly. */
+  rating_scale: "acceptance" | "rejection" | null;
+  comment: string | null;
+  config: PlanConfig;
+  proposal: PlanResult;
+  modified: { days: EditedDay[]; evaluation: EvaluatedPlan } | null;
+}
+
+export interface FeedbackIn {
+  config: PlanConfig;
+  proposal: PlanResult;
+  decision: Decision;
+  rating?: number;
+  comment?: string;
+  modified?: { days: EditedDay[] };
+}
+
 export interface ModelEvidence {
   comparison: { target: string; specification: string; model: string; selected: boolean; parameters: string;
     val_rmse: number; val_r2: number; val_n: number; test_mae: number; test_rmse: number; test_r2: number; test_n: number }[];
@@ -323,5 +362,11 @@ export const api = {
   planHistory: (athlete: string, start: string) => req<PlanHistory>(`/api/plan/history${qs({ athlete, start })}`),
   planOptimize: (config: PlanConfig) =>
     req<PlanResult>("/api/plan/optimize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(config) }),
+  planEvaluate: (config: PlanConfig, days: EditedDay[]) =>
+    req<EvaluatedPlan>("/api/plan/evaluate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ config, days }) }),
+  planFeedbackCreate: (body: FeedbackIn) =>
+    req<FeedbackRecord>("/api/plan/feedback", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  planFeedbackList: (athlete?: string) => req<FeedbackRecord[]>(`/api/plan/feedback${qs({ athlete })}`),
+  planFeedbackGet: (id: number) => req<FeedbackRecord>(`/api/plan/feedback/${id}`),
   planModels: () => req<ModelEvidence>("/api/plan/models"),
 };
