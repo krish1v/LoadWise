@@ -11,6 +11,7 @@ import { CalendarPage } from "./pages/Calendar";
 import { DailyPage } from "./pages/Daily";
 import { QualityPage } from "./pages/Quality";
 import { PlanPage } from "./pages/Plan";
+import { SquadPlanPage } from "./pages/SquadPlan";
 
 const qc = new QueryClient({ defaultOptions: { queries: { staleTime: 60_000, refetchOnWindowFocus: false, retry: 1 } } });
 
@@ -26,7 +27,8 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
               <Route path="/calendar" element={<CalendarPage />} />
               <Route path="/daily" element={<DailyPage />} />
               <Route path="/quality" element={<QualityPage />} />
-              <Route path="/plan" element={<PlanPage />} />
+              <Route path="/plan" element={<SquadPlanPage />} />
+              <Route path="/plan/individual" element={<PlanPage />} />
               <Route path="/forecast" element={<Navigate to="/plan" replace />} />
             </Routes>
           </Layout>

@@ -236,6 +236,97 @@ export interface PlanMeta {
   scope: string;
 }
 
+export interface WorkloadLimits {
+  ml_limit: number;
+  trimp_limit: number;
+  ml_buffer: number;
+  trimp_buffer: number;
+  weekly_ml_limit: number;
+  weekly_trimp_limit: number;
+}
+
+export interface SquadDayInput {
+  kind: Activity;
+  team: number;
+  individual_limit: number | null;
+}
+
+export interface SquadAthleteInput {
+  athlete: string;
+  availability: number[];
+  other_recorded: number;
+  limits: WorkloadLimits;
+  allow_pooled: boolean;
+}
+
+export interface SquadAthleteDefaults extends SquadAthleteInput {
+  label: string;
+  reason: string | null;
+}
+
+export interface SquadConfig {
+  start: string;
+  days: SquadDayInput[];
+  athletes: SquadAthleteInput[];
+  objective: "terminal" | "cumulative";
+  step: 1 | 5 | 10;
+}
+
+export interface SquadDefaults {
+  start: string;
+  week_dates: string[];
+  days: SquadDayInput[];
+  athletes: SquadAthleteDefaults[];
+  in_fitting_period: boolean;
+}
+
+export interface SquadScore {
+  total: number | null;
+  average: number | null;
+}
+
+export interface SquadBaseline extends SquadScore {
+  feasible: boolean;
+}
+
+export interface AthleteBaseline {
+  day7_mip: number | null;
+  mip_sum: number | null;
+  feasible: boolean;
+  reason: string | null;
+}
+
+export interface SquadDayResult extends SquadDayInput {
+  day: number;
+  date: string;
+  individual_minutes: number;
+  mip_total: number | null;
+  mip_average: number | null;
+}
+
+export interface SquadAthleteResult {
+  athlete: string;
+  athlete_id: string;
+  pooled: boolean;
+  reason: string | null;
+  summary: PlanSummary;
+  original: PlanResult["original"];
+  baseline: AthleteBaseline;
+}
+
+export interface SquadResult {
+  start: string;
+  objective: "terminal" | "cumulative";
+  athlete_count: number;
+  score: SquadScore;
+  baseline: SquadBaseline;
+  improvement: number | null;
+  days: SquadDayResult[];
+  athletes: SquadAthleteResult[];
+  explanation: string;
+  limitation: string;
+}
+
 export interface PlanHistory {
   athlete_id: string;
   label: string;
@@ -359,6 +450,9 @@ export const api = {
   importDemo: (year: number) => req<{ status: string }>(`/api/imports/demo${qs({ season_start_year: year })}`, { method: "POST" }),
   reset: () => req<unknown>("/api/store", { method: "DELETE" }),
   planMeta: () => req<PlanMeta>("/api/plan/meta"),
+  squadDefaults: (start: string) => req<SquadDefaults>(`/api/plan/squad/defaults${qs({ start })}`),
+  squadOptimize: (config: SquadConfig) =>
+    req<SquadResult>("/api/plan/squad/optimize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(config) }),
   planHistory: (athlete: string, start: string) => req<PlanHistory>(`/api/plan/history${qs({ athlete, start })}`),
   planOptimize: (config: PlanConfig) =>
     req<PlanResult>("/api/plan/optimize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(config) }),

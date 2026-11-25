@@ -463,6 +463,80 @@ def create_app(db_path: Optional[str] = None, autoload_demo: Optional[bool] = No
             "history": past[cols].astype(object).where(past[cols].notna(), None).to_dict("records"),
         })
 
+    @app.get("/api/plan/squad/defaults")
+    def squad_defaults(start: str):
+        from planner import jsonable, SCHEDULE
+        from planner.features import day_date
+        from planner.scenarios import in_fitting_period, week_dates
+        from planner.squad import LIMITS
+
+        result, context = planning()
+        try:
+            start_day = context.start_day(start)
+            athletes = []
+            for athlete in result.output["athletes"]:
+                if athlete["label"] not in context.roster:
+                    continue
+                defaults, reason, _, _ = context.defaults(athlete["label"], start_day)
+                limits = {name: defaults[name] for name in LIMITS}
+                athletes.append({
+                    "athlete": athlete["athlete_id"],
+                    "label": athlete["label"],
+                    "availability": [30] * 7,
+                    "other_recorded": 0,
+                    "allow_pooled": False,
+                    "limits": limits,
+                    "reason": reason,
+                })
+        except ValueError as error:
+            raise HTTPException(400, str(error))
+
+        days = []
+        for kind in SCHEDULE:
+            team_minutes = 0
+            if kind == "training":
+                team_minutes = 90
+            days.append({"kind": kind, "team": team_minutes, "individual_limit": None})
+        return jsonable({
+            "start": day_date(start_day),
+            "week_dates": week_dates(start_day),
+            "athletes": athletes,
+            "in_fitting_period": in_fitting_period(start_day),
+            "days": days,
+        })
+
+    @app.post("/api/plan/squad/optimize")
+    def squad_optimize(config: dict):
+        from planner import jsonable
+        from planner.squad import recommend_squad
+
+        result, context = planning()
+        athletes = config.get("athletes")
+        if not isinstance(athletes, list):
+            raise HTTPException(400, "Provide the selected athletes.")
+
+        selected = []
+        for athlete in athletes:
+            if not isinstance(athlete, dict) or not isinstance(athlete.get("athlete"), str):
+                raise HTTPException(400, "Select a roster athlete for each input row.")
+            athlete_id = athlete["athlete"]
+            inputs = athlete.copy()
+            inputs["athlete_id"] = athlete_id
+            inputs["athlete"] = plan_label(result, athlete_id)
+            selected.append(inputs)
+        squad_config = config.copy()
+        squad_config["athletes"] = selected
+
+        if not plan_lock.acquire(blocking=False):
+            raise HTTPException(409, "An optimization is already running. Try again when it finishes.")
+        try:
+            squad_plan = recommend_squad(context, squad_config)
+            return jsonable(squad_plan)
+        except ValueError as error:
+            raise HTTPException(400, str(error))
+        finally:
+            plan_lock.release()
+
     @app.post("/api/plan/optimize")
     def plan_optimize(config: dict):
         from planner import jsonable, recommend
